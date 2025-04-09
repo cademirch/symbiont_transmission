@@ -1,0 +1,8 @@
+
+# pixi environments
+.pixi
+*.egg-info
+simulator/target
+.snakemake
+results/
+pixi.lock
