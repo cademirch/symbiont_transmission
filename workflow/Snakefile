@@ -1,27 +1,27 @@
 rule all:
     input:
         expand(
-            "results/sample_size/{n}/replicate_{i}.{ext}",
-            n=[10],
-            i=[2, 4, 16, 32, 64],
-            ext=["csv", "tree"],
+            "results/sample_size={n}/bottleneck={nb}/replicate_{i}.csv",
+            n=[1000,10_000,100_000,1_000_000],
+            i=range(100),
+            nb=[2,4,16,32,64,128]
         ),
 
 
 rule run_sim:
     output:
-        out="results/sample_size/{n}/replicate_{i}.csv",
-        tree="results/sample_size/{n}/replicate_{i}.tree",
+        out="results/sample_size={n}/bottleneck={nb}/replicate_{i}.csv",
+        
     threads: 2
     shell:
         """
         ./simulator/target/release/simulator \
             -n {wildcards.n} \
-            -N 100000 \
-            -b {wildcards.i} \
+            -N 4294967296 \
+            -b {wildcards.nb} \
             -g 10240 \
             -u 0.004 \
             -r \
             -a {output.out} \
-            -o {output.tree}
+            -s 1000
         """

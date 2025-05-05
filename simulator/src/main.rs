@@ -1,8 +1,10 @@
+use anyhow::{bail, Result};
 use clap::Parser;
 use log::trace;
 use phylotree::tree::{Node, NodeId, Tree};
 use rand::prelude::*;
 use rand_distr::{Distribution, Poisson};
+use statrs::distribution::{Discrete, Hypergeometric};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -31,8 +33,15 @@ struct Cli {
     #[arg(short = 'a', long, default_value = "afs.csv")]
     afs_output: PathBuf,
 
-    #[arg(short = 'r', long, help = "Output relative frequencies instead of absolute counts")]
+    #[arg(
+        short = 'r',
+        long,
+        help = "Output relative frequencies instead of absolute counts"
+    )]
     relative_freq: bool,
+
+    #[arg(short = 's', long)]
+    subsample: Option<u64>,
 }
 
 fn main() {
@@ -104,11 +113,16 @@ fn main() {
     if let Some(path) = &cli.output_file {
         tree.to_file(path).unwrap();
     }
-    
 
     // Calculate and export the AFS
     let afs_start = Instant::now();
-    let afs = calculate_afs(&tree, &mutation_counts, cli.sample_size as usize);
+    let afs = if let Some(subsample_size) = cli.subsample {
+        let orig_afs = calculate_afs(&tree, &mutation_counts, cli.sample_size as usize);
+        subsample_afs(&orig_afs, cli.population_size, subsample_size).unwrap()
+    } else {
+        calculate_afs(&tree, &mutation_counts, cli.sample_size as usize)
+    };
+
     afs_time = afs_start.elapsed();
     export_afs(&afs, &cli.afs_output, cli.relative_freq).unwrap();
 
@@ -391,12 +405,62 @@ fn calculate_afs(
     afs
 }
 
-fn export_afs(afs: &HashMap<usize, usize>, output_path: &std::path::Path, relative: bool) -> std::io::Result<()> {
+fn subsample_afs(
+    original_afs: &HashMap<usize, usize>,
+    n_original: u64,
+    n_subsample: u64,
+) -> Result<HashMap<usize, usize>> {
+    let mut subsampled_afs = HashMap::new();
+
+    // Process each frequency bin in the original AFS
+    for (&orig_freq, &variant_count) in original_afs.iter() {
+        let orig_freq = orig_freq as u64; // Convert from usize to u64
+
+        if variant_count > 0 {
+            for j in 0..std::cmp::min(orig_freq, n_subsample) as usize {
+                let subsample_freq = (j + 1) as u64;
+
+                // Create hypergeometric distribution to calculate probability
+                let hyper_dist = match Hypergeometric::new(
+                    n_original,
+                    orig_freq,
+                    n_subsample
+                ) {
+                    Ok(dist) => dist,
+                    Err(_) =>  bail!("Failed to create hypergeometric distribution with parameters: population={}, successes={}, draws={}", 
+                                                n_original, orig_freq, n_subsample)
+                };
+
+                // Calculate probability
+                let prob = hyper_dist.pmf(subsample_freq);
+
+                // Expected number of variants that will move to this subsampled frequency class
+                let expected_count = variant_count as f64 * prob;
+
+                // Round to nearest integer and convert to usize
+                let count = expected_count.round() as usize;
+
+                // Only add non-zero entries to the HashMap
+                if count > 0 {
+                    *subsampled_afs.entry(j + 1).or_insert(0) += count;
+                }
+            }
+        }
+    }
+
+    Ok(subsampled_afs)
+}
+
+fn export_afs(
+    afs: &HashMap<usize, usize>,
+    output_path: &std::path::Path,
+    relative: bool,
+) -> std::io::Result<()> {
     use std::fs::File;
     use std::io::Write;
 
     let mut file = File::create(output_path)?;
-    
+
     // Calculate total count for relative frequencies if needed
     let total_count: usize = if relative {
         afs.values().sum()
