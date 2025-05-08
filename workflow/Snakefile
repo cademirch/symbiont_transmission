@@ -12,7 +12,7 @@ rule run_sim:
     output:
         out="results/sample_size={n}/bottleneck={nb}/replicate_{i}.csv",
         
-    threads: 2
+    threads: 1
     shell:
         """
         ./simulator/target/release/simulator \
@@ -21,7 +21,6 @@ rule run_sim:
             -b {wildcards.nb} \
             -g 10240 \
             -u 0.004 \
-            -r \
             -a {output.out} \
             -s 1000
         """

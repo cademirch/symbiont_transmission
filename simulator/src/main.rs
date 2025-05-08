@@ -1,10 +1,14 @@
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use clap::Parser;
 use log::trace;
-use phylotree::tree::{Node, NodeId, Tree};
+use phylotree::tree::{Node, NodeId, Tree, TreeError};
 use rand::prelude::*;
+use rand::rngs::{StdRng, ThreadRng};
+use rand::RngCore;
+use rand::SeedableRng;
 use rand_distr::{Distribution, Poisson};
 use statrs::distribution::{Discrete, Hypergeometric};
+use statrs::statistics::{Max, Min};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -13,7 +17,7 @@ use std::time::{Duration, Instant};
 #[command(version, about, long_about = None)]
 struct Cli {
     #[arg(short = 'n', long)]
-    sample_size: u128,
+    sample_size: u64,
 
     #[arg(short = 'N', long)]
     population_size: u64,
@@ -33,6 +37,9 @@ struct Cli {
     #[arg(short = 'a', long, default_value = "afs.csv")]
     afs_output: PathBuf,
 
+    #[arg(long)]
+    seed: Option<u64>,
+
     #[arg(
         short = 'r',
         long,
@@ -47,7 +54,11 @@ struct Cli {
 fn main() {
     env_logger::init();
     let cli = Cli::parse();
-    let mut rng = rand::rng();
+    let mut rng: Box<dyn RngCore> = if let Some(seed) = cli.seed {
+        Box::new(StdRng::seed_from_u64(seed))
+    } else {
+        Box::new(rand::rng())
+    };
 
     let simulation_start = Instant::now();
 
@@ -117,11 +128,23 @@ fn main() {
     // Calculate and export the AFS
     let afs_start = Instant::now();
     let afs = if let Some(subsample_size) = cli.subsample {
-        let orig_afs = calculate_afs(&tree, &mutation_counts, cli.sample_size as usize);
-        subsample_afs(&orig_afs, cli.population_size, subsample_size).unwrap()
+        let orig_afs = calculate_afs(&tree, &mutation_counts).unwrap();
+        export_afs(
+            &orig_afs,
+            &cli.afs_output.with_extension("og.csv"),
+            cli.relative_freq,
+        )
+        .unwrap();
+        subsample_afs(
+            &orig_afs,
+            cli.sample_size.try_into().unwrap(),
+            subsample_size,
+        )
+        .unwrap()
     } else {
-        calculate_afs(&tree, &mutation_counts, cli.sample_size as usize)
+        calculate_afs(&tree, &mutation_counts).unwrap()
     };
+    // let afs = calculate_afs(&tree, &mutation_counts).unwrap();
 
     afs_time = afs_start.elapsed();
     export_afs(&afs, &cli.afs_output, cli.relative_freq).unwrap();
@@ -253,7 +276,7 @@ fn binary(
 }
 
 // Helper function to create initial samples
-fn create_initial_sample(sample_size: u128) -> (Tree, Vec<NodeId>) {
+fn create_initial_sample(sample_size: u64) -> (Tree, Vec<NodeId>) {
     let mut tree = Tree::new();
     let mut active_lineages = Vec::with_capacity(sample_size as usize);
 
@@ -355,54 +378,29 @@ fn add_branch_mutations<R: Rng>(
     let num_mutations = poisson.sample(rng) as usize;
 
     if num_mutations > 0 {
-        // Store mutation count
-        mutation_counts.insert(*node_id, num_mutations);
-
-        // Add to node comment - uncomment if needed
-        // let node = tree.get_mut(node_id).unwrap();
-        // node.comment = Some(format!("mutations={}", num_mutations));
+        *mutation_counts.entry(*node_id).or_insert(0) += num_mutations;
     }
 }
 
-fn calculate_afs(
+pub fn calculate_afs(
     tree: &Tree,
     mutation_counts: &HashMap<NodeId, usize>,
-    sample_size: usize,
-) -> HashMap<usize, usize> {
-    // Initialize AFS as a HashMap (frequency -> count)
+) -> Result<HashMap<usize, usize>, TreeError> {
+    let sample_size = tree.n_leaves();
     let mut afs = HashMap::new();
 
-    // Get all leaf nodes once
-    let leaves = tree.get_leaves();
-    let leaf_set: std::collections::HashSet<_> = leaves.iter().collect();
+    for (&node, &num_mut) in mutation_counts {
+        // get all the leaves descending from `node` in one shot:
+        let leaves = tree.get_subtree_leaves(&node)?;
+        let k = leaves.len(); // how many leaves carry this mutation
 
-    // Process only nodes that have mutations
-    for (node_id, &mutation_count) in mutation_counts {
-        // If this is a leaf node, it's a singleton mutation
-        if leaf_set.contains(node_id) {
-            *afs.entry(1).or_insert(0) += mutation_count;
-            continue;
-        }
-
-        // Find leaf descendants for this mutation node
-        let descendants = match tree.get_descendants(node_id) {
-            Ok(desc) => desc,
-            Err(_) => continue,
-        };
-
-        // Count only leaf descendants
-        let leaf_descendants = descendants
-            .iter()
-            .filter(|&desc_id| leaf_set.contains(desc_id))
-            .count();
-
-        // Add to the appropriate AFS bin if within range
-        if leaf_descendants > 0 && leaf_descendants < sample_size {
-            *afs.entry(leaf_descendants).or_insert(0) += mutation_count;
+        // only count polymorphic sites (1 ≤ k < sample_size)
+        if (1..sample_size).contains(&k) {
+            *afs.entry(k).or_insert(0) += num_mut;
         }
     }
 
-    afs
+    Ok(afs)
 }
 
 fn subsample_afs(
@@ -416,34 +414,29 @@ fn subsample_afs(
     for (&orig_freq, &variant_count) in original_afs.iter() {
         let orig_freq = orig_freq as u64; // Convert from usize to u64
 
-        if variant_count > 0 {
-            for j in 0..std::cmp::min(orig_freq, n_subsample) as usize {
-                let subsample_freq = (j + 1) as u64;
+        let hyper = Hypergeometric::new(n_original, orig_freq, n_subsample)
+            .map_err(|e| anyhow!("Hypergeometric::new failed: {}", e))?;
 
-                // Create hypergeometric distribution to calculate probability
-                let hyper_dist = match Hypergeometric::new(
-                    n_original,
-                    orig_freq,
-                    n_subsample
-                ) {
-                    Ok(dist) => dist,
-                    Err(_) =>  bail!("Failed to create hypergeometric distribution with parameters: population={}, successes={}, draws={}", 
-                                                n_original, orig_freq, n_subsample)
-                };
+        // iterate over possible subsample counts x
+        let lower = hyper.min(); // = max(0, n + K - N)
+        let upper = hyper.max(); // = min(K, n)
+        for x in lower..=upper {
+            // skip x=0 if you only care about polymorphic sites
+            if x == 0 {
+                continue;
+            }
 
-                // Calculate probability
-                let prob = hyper_dist.pmf(subsample_freq);
+            // log-PMF is stable
+            let logp = hyper.ln_pmf(x);
+            let p = logp.exp(); // back to probability space
+            if !p.is_finite() {
+                continue;
+            }
 
-                // Expected number of variants that will move to this subsampled frequency class
-                let expected_count = variant_count as f64 * prob;
-
-                // Round to nearest integer and convert to usize
-                let count = expected_count.round() as usize;
-
-                // Only add non-zero entries to the HashMap
-                if count > 0 {
-                    *subsampled_afs.entry(j + 1).or_insert(0) += count;
-                }
+            let expected = (variant_count as f64) * p;
+            let count = expected.round() as usize;
+            if count > 0 {
+                *subsampled_afs.entry(x as usize).or_insert(0) += count;
             }
         }
     }
