@@ -12,6 +12,7 @@ use statrs::statistics::{Max, Min};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use rand_chacha::ChaCha20Rng;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -57,7 +58,7 @@ fn main() {
     let mut rng: Box<dyn RngCore> = if let Some(seed) = cli.seed {
         Box::new(StdRng::seed_from_u64(seed))
     } else {
-        Box::new(rand::rng())
+        Box::new(ChaCha20Rng::from_os_rng())
     };
 
     let simulation_start = Instant::now();
@@ -476,7 +477,7 @@ fn export_afs(
             if relative && total_count > 0 {
                 // Output relative frequency (as a decimal)
                 let rel_freq = count as f64 / total_count as f64;
-                writeln!(file, "{},{:.6}", freq, rel_freq)?;
+                writeln!(file, "{},{}", freq, rel_freq)?;
             } else {
                 // Output absolute count
                 writeln!(file, "{},{}", freq, count)?;

@@ -1,26 +1,32 @@
+from pathlib import Path
+SIM_BINARY = Path(Path(workflow.basedir).parent, "simulator/target/release/simulator")
 rule all:
     input:
         expand(
             "results/sample_size={n}/bottleneck={nb}/replicate_{i}.csv",
             n=[1000,10_000,100_000,1_000_000],
-            i=range(100),
+            i=range(10),
             nb=[2,4,16,32,64,128]
         ),
+    script:
+        "scripts/plot.py"
 
 
 rule run_sim:
+    input:
+        simulator = SIM_BINARY
     output:
         out="results/sample_size={n}/bottleneck={nb}/replicate_{i}.csv",
         
     threads: 1
     shell:
         """
-        ./simulator/target/release/simulator \
+        {input.simulator} \
             -n {wildcards.n} \
             -N 4294967296 \
             -b {wildcards.nb} \
             -g 10240 \
             -u 0.004 \
             -a {output.out} \
-            -s 1000
+            -s 1000 \
         """

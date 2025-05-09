@@ -6,3 +6,4 @@ simulator/target
 .snakemake
 results/
 pixi.lock
+results.bak/
