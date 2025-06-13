@@ -1,32 +1,80 @@
+import numpy as np
+import json
 from pathlib import Path
+
 SIM_BINARY = Path(Path(workflow.basedir).parent, "simulator/target/release/simulator")
+
+# Set random seed for reproducibility
+np.random.seed(42)
+
+
+N_PARAM_SETS = 100
+N_REPLICATES = 10
+
+
+def sample_parameters():
+    params = []
+    for i in range(N_PARAM_SETS):
+        # N (popsize) -> Unif(10^8, 10^10)
+        N = int(np.random.uniform(1e8, 1e10))
+        
+        # u (mutation rate) -> logUnif(10^-9, 10^-8)
+        u = 10 ** np.random.uniform(-9, -8)
+        
+        # Nb (bottleneck size) -> logUnif(1, 1000)
+        Nb = int(10 ** np.random.uniform(0, 3))  # log10(1) = 0, log10(1000) = 3
+        
+        # Gs (stasis generations) -> Unif(100, 10000)
+        Gs = int(np.random.uniform(100, 10000))
+        
+        params.append({
+            'param_set': i,
+            'N': N,
+            'u': u,
+            'Nb': Nb,
+            'Gs': Gs
+        })
+    
+    return params
+
+
+PARAM_SETS = sample_parameters()
+
+
+with open("parameter_sets.json", "w") as f:
+    json.dump(PARAM_SETS, f, indent=2)
+
 rule all:
     input:
         expand(
-            "results/sample_size={n}/bottleneck={nb}/replicate_{i}.csv",
-            n=[1000,10_000,100_000,1_000_000],
-            i=range(10),
-            nb=[2,4,16,32,64,128]
+            "results/param_set_{param_set}/afs.csv",
+            param_set=range(N_PARAM_SETS)
         ),
-    script:
-        "scripts/plot.py"
-
+        
+    
 
 rule run_sim:
     input:
         simulator = SIM_BINARY
     output:
-        out="results/sample_size={n}/bottleneck={nb}/replicate_{i}.csv",
-        
+        afs="results/param_set_{param_set}/afs.csv",
+        config="results/param_set_{param_set}/config.json"
+    params:
+        param_data = lambda wildcards: PARAM_SETS[int(wildcards.param_set)]
     threads: 1
     shell:
         """
+        mkdir -p results/param_set_{wildcards.param_set}
+        
         {input.simulator} \
-            -n {wildcards.n} \
-            -N 4294967296 \
-            -b {wildcards.nb} \
-            -g 10240 \
-            -u 0.004 \
-            -a {output.out} \
-            -s 1000 \
+            -n 10000000 \
+            -N {params.param_data[N]} \
+            -b {params.param_data[Nb]} \
+            -g {params.param_data[Gs]} \
+            -u {params.param_data[u]} \
+            --output-dir results/param_set_{wildcards.param_set} \
+            -R {N_REPLICATES} \
+            --seed {wildcards.param_set}
         """
+
+
