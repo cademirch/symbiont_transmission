@@ -1,80 +1,123 @@
 import numpy as np
 import json
+import time
 from pathlib import Path
-
-SIM_BINARY = Path(Path(workflow.basedir).parent, "simulator/target/release/simulator")
-
-# Set random seed for reproducibility
-np.random.seed(42)
+from scipy.stats import loguniform, uniform, randint
 
 
-N_PARAM_SETS = 100
-N_REPLICATES = 10
+DEPTH_FILES = [
+    Path(Path(workflow.basedir), "circles_depth.bed"),
+    Path(Path(workflow.basedir), "duplex_depth.bed"),
+]
+
+N_PARAM_SETS = 5
+N_REPLICATES = 1
+GENOME_SIZE = 1.2e6
 
 
 def sample_parameters():
-    params = []
-    for i in range(N_PARAM_SETS):
-        # N (popsize) -> Unif(10^8, 10^10)
-        N = int(np.random.uniform(1e8, 1e10))
-        
-        # u (mutation rate) -> logUnif(10^-9, 10^-8)
-        u = 10 ** np.random.uniform(-9, -8)
-        
-        # Nb (bottleneck size) -> logUnif(1, 1000)
-        Nb = int(10 ** np.random.uniform(0, 3))  # log10(1) = 0, log10(1000) = 3
-        
-        # Gs (stasis generations) -> Unif(100, 10000)
-        Gs = int(np.random.uniform(100, 10000))
-        
-        params.append({
-            'param_set': i,
-            'N': N,
-            'u': u,
-            'Nb': Nb,
-            'Gs': Gs
-        })
-    
-    return params
+    # N (popsize) -> Unif(10^8, 10^10)
+    N_values = uniform.rvs(loc=1e8, scale=9e9, size=N_PARAM_SETS).astype(int)
 
+    # u (mutation rate per site) -> logUnif(10^-9, 10^-8)
+    u_per_site = loguniform.rvs(1e-9, 1e-8, size=N_PARAM_SETS)
+    u_total = u_per_site * GENOME_SIZE
 
-PARAM_SETS = sample_parameters()
+    # Nb (bottleneck size) -> logUnif(1, 1000)
+    Nb_values = loguniform.rvs(1, 1000, size=N_PARAM_SETS).astype(int)
 
+    # Gs (stasis generations) -> Unif(100, 10000)
+    Gs_values = uniform.rvs(loc=100, scale=9900, size=N_PARAM_SETS).astype(int)
 
-with open("parameter_sets.json", "w") as f:
-    json.dump(PARAM_SETS, f, indent=2)
+    sim_seeds = randint.rvs(0, 2**32, size=N_PARAM_SETS)
+
+    return [
+        {
+            "param_set": i,
+            "sim_seed": int(sim_seeds[i]),
+            "N": int(N_values[i]),
+            "u_per_site": float(u_per_site[i]),
+            "u_total": float(u_total[i]),
+            "genome_size": int(GENOME_SIZE),
+            "Nb": int(Nb_values[i]),
+            "Gs": int(Gs_values[i]),
+        }
+        for i in range(N_PARAM_SETS)
+    ]
+
 
 rule all:
     input:
-        expand(
-            "results/param_set_{param_set}/afs.csv",
-            param_set=range(N_PARAM_SETS)
-        ),
-        
-    
+        expand("param_set_{param_set}/config.json", param_set=range(N_PARAM_SETS)),
+
+
+rule generate_all_params:
+    output:
+        params_json="parameter_sets.json",
+    run:
+        param_sets = sample_parameters()
+
+        output_data = {
+            "generation_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "n_param_sets": N_PARAM_SETS,
+            "n_replicates": N_REPLICATES,
+            "genome_size": int(GENOME_SIZE),
+            "parameter_sets": param_sets,
+        }
+
+        with open(output.params_json, "w") as f:
+            json.dump(output_data, f, indent=2)
+
+
+rule build_simulator:
+    input:
+        cargo_toml=Path(Path(workflow.basedir).parent, "simulator/Cargo.toml"),
+        src_files=Path(Path(workflow.basedir).parent, "simulator/src/main.rs"),
+    output:
+        binary=Path(Path(workflow.basedir).parent, "simulator/target/release/simulator"),
+    shell:
+        """
+        cargo build --release --manifest-path {input.cargo_toml}
+        """
+
 
 rule run_sim:
     input:
-        simulator = SIM_BINARY
+        simulator=rules.build_simulator.output.binary,
+        params_json="parameter_sets.json",
     output:
-        afs="results/param_set_{param_set}/afs.csv",
-        config="results/param_set_{param_set}/config.json"
-    params:
-        param_data = lambda wildcards: PARAM_SETS[int(wildcards.param_set)]
+        config="param_set_{param_set}/config.json",
+    log:
+        "param_set_{param_set}/log.txt",
     threads: 1
-    shell:
-        """
-        mkdir -p results/param_set_{wildcards.param_set}
+    run:
+        import json
+
+        with open(input.params_json, "r") as f:
+            param_file = json.load(f)
+
+        param_data = param_file["parameter_sets"][int(wildcards.param_set)]
+
+        # Create output directory
+        shell(f"mkdir -p param_set_{wildcards.param_set}")
+
+        depth_files_str = ",".join(str(p) for p in DEPTH_FILES)
+
+        cmd_args = [
+            str(input.simulator),
+            "--sample-size", "10000000",
+            "--population-size", str(param_data['N']),
+            "--bottleneck-size", str(param_data['Nb']),
+            "--stasis-generations", str(param_data['Gs']),
+            "--mutation-rate", str(param_data['u_total']),
+            "--output-dir", f"param_set_{wildcards.param_set}",  
+            "--runs", str(N_REPLICATES),
+            "--seed", str(param_data['sim_seed']),
+            "--depth-files", depth_files_str
+        ]
+        cmd = " ".join(cmd_args)
         
-        {input.simulator} \
-            -n 10000000 \
-            -N {params.param_data[N]} \
-            -b {params.param_data[Nb]} \
-            -g {params.param_data[Gs]} \
-            -u {params.param_data[u]} \
-            --output-dir results/param_set_{wildcards.param_set} \
-            -R {N_REPLICATES} \
-            --seed {wildcards.param_set}
-        """
+        print(f"Running command: {cmd}")
 
-
+        
+        shell(f"{cmd} > {log} 2>&1")

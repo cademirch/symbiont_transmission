@@ -2,7 +2,7 @@
 authors = ["Cade Mirchandani <cmirchan@ucsc.edu>"]
 channels = ["conda-forge"]
 name = "symbiont_transmission"
-platforms = ["osx-arm64"]
+platforms = ["osx-arm64", "linux-64"]
 version = "0.1.0"
 
 [tasks]
@@ -19,3 +19,4 @@ pandas = ">=2.2.3, <3"
 seaborn = ">=0.13.2, <0.14"
 snkmt = ">=0.1.0, <0.2"
 snakemake-logger-plugin-snkmt = ">=0.1.0, <0.2"
+scipy = ">=1.15.3, <2"

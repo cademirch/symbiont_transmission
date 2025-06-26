@@ -7,3 +7,4 @@ simulator/target
 results/
 pixi.lock
 results.bak/
+workflow/*.bed

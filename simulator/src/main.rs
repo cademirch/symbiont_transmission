@@ -4,21 +4,26 @@ use log::trace;
 use phylotree::tree::{Node, NodeId, Tree, TreeError};
 use rand::prelude::*;
 use rand::rngs::{StdRng, ThreadRng};
+
 use rand::RngCore;
 use rand::SeedableRng;
 use rand_distr::{Distribution, Poisson, Uniform};
+use serde::{Serialize, Deserialize};
 use statrs::distribution::{Discrete, Hypergeometric};
 use statrs::statistics::{Max, Min};
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Write;
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use std::fs::File;
-use std::io::{BufRead, BufReader};
-use serde::Serialize;
 
-#[derive(Parser, Serialize)]
+#[derive(Parser, Serialize, Deserialize)]
 #[command(version, about, long_about = None)]
 struct Cli {
+    #[arg(long, help = "Load configuration from JSON file")]
+    config: Option<PathBuf>,
+
     #[arg(short = 'n', long)]
     sample_size: u64,
 
@@ -56,263 +61,218 @@ struct Cli {
     #[arg(long, help = "Paths to files containing depth distributions", value_delimiter = ',')]
     depth_files: Vec<PathBuf>,
 
-    #[arg(long, default_value = "2", help = "Minimum number of alternative reads required for variant detection")]
+    #[arg(
+        long,
+        default_value = "2",
+        help = "Minimum number of alternative reads required for variant detection"
+    )]
     min_alt_reads: u32,
 
-    #[arg(long, default_value = "10", help = "Minimum depth required for variant calling")]
+    #[arg(
+        long,
+        default_value = "10",
+        help = "Minimum depth required for variant calling"
+    )]
     min_depth: u32,
 
     #[arg(long, default_value = "output", help = "Output directory for results")]
     output_dir: PathBuf,
 
-    #[arg(long, default_value = "0.05", help = "Bin size for folded AFS relative frequencies")]
+    #[arg(
+        long,
+        default_value = "0.05",
+        help = "Bin size for folded AFS relative frequencies"
+    )]
     bin_size: f64,
 
-    #[arg(short = 'R', long, default_value = "1", help = "Number of simulation runs")]
-    runs: u32,
+    #[arg(
+        short = 'R',
+        long,
+        default_value = "1",
+        help = "Number of simulation runs"
+    )]
+    runs: usize,
 }
 
 impl Cli {
-    pub fn to_json(&self) -> Result<String> {
-        serde_json::to_string_pretty(self)
-            .map_err(|e| anyhow!("Failed to serialize CLI to JSON: {}", e))
+    pub fn to_json(&self, file_path: &PathBuf) -> Result<()> {
+        let json_string = serde_json::to_string_pretty(self)
+            .map_err(|e| anyhow!("Failed to serialize CLI to JSON: {}", e))?;
+        
+        let mut file = File::create(file_path)?;
+        write!(file, "{}", json_string)?;
+        
+        Ok(())
+    }
+    fn from_config(config_path: &PathBuf) -> Result<Self> {
+        let config_str = std::fs::read_to_string(config_path)?;
+        let cli: Cli = serde_json::from_str(&config_str)?;
+        Ok(cli)
     }
 }
 
-#[derive(Clone, Copy)]
-enum AFSType {
-    Absolute,
-    Relative,
-    Binned,
+fn write_all_mutations_csv(
+    all_mutations: &[HashMap<usize, usize>],
+    file_path: &PathBuf,
+) -> Result<()> {
+    let mut file = File::create(file_path)?;
+
+    writeln!(file, "run,allele_freq,num_observed")?;
+
+    for (run_idx, mutations) in all_mutations.iter().enumerate() {
+        for (&allele_freq, &num_observed) in mutations.iter() {
+            writeln!(file, "{},{},{}", run_idx, allele_freq, num_observed)?;
+        }
+    }
+
+    Ok(())
 }
 
-fn main() {
-    env_logger::init();
-    let cli = Cli::parse();
+fn write_subsampled_mutations_csv(
+    subsampled_mutations: &[Vec<(PathBuf, Vec<usize>)>],
+    bin_size: f64,
+    output_dir: &PathBuf,
+) -> Result<()> {
     
-    // Create output directory
+    let mut depth_file_data: HashMap<PathBuf, Vec<(usize, Vec<usize>)>> = HashMap::new();
+    
+    for (run_idx, run_data) in subsampled_mutations.iter().enumerate() {
+        for (depth_file, binned_counts) in run_data {
+            depth_file_data
+                .entry(depth_file.clone())
+                .or_insert_with(Vec::new)
+                .push((run_idx, binned_counts.clone()));
+        }
+    }
+    
+    for (depth_file, run_data) in depth_file_data {
+        let depth_file_stem = depth_file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown");
+        
+        let output_path = output_dir.join(format!("{}_subsampled_mutations.csv", depth_file_stem));
+        let mut file = File::create(&output_path)?;
+        
+        writeln!(file, "run,allele_freq_bin,num_observed")?;
+        
+        for (run_idx, binned_counts) in run_data {
+            for (bin_idx, &num_observed) in binned_counts.iter().enumerate() {
+                if num_observed > 0 {
+                    let bin_start = bin_idx as f64 * bin_size;
+                    writeln!(file, "{},{:.5},{}", run_idx, bin_start, num_observed)?;
+                }
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let cli = if let Some(config_path) = std::env::args().find(|arg| arg == "--config") {
+        // Get the config file path (next argument)
+        let config_file = std::env::args().nth(
+            std::env::args().position(|x| x == "--config").unwrap() + 1
+        ).ok_or_else(|| anyhow!("Config file path required after --config"))?;
+        
+        Cli::from_config(&PathBuf::from(config_file))?
+    } else {
+        Cli::parse()
+    };
+
     std::fs::create_dir_all(&cli.output_dir).unwrap();
 
-    let simulation_start = Instant::now();
-    
-    // Initialize cumulative timing variables
-    let mut total_mutation_time = Duration::default();
-    let mut total_stasis_time = Duration::default();
-    let mut total_binary_time = Duration::default();
-    let mut total_afs_time = Duration::default();
-    let mut total_mutation_calls = 0;
-    let mut total_mutations = 0;
+    let mut all_mutations: Vec<HashMap<usize, usize>> = Vec::with_capacity(cli.runs);
+    let mut subsampled_mutations: Vec<Vec<(PathBuf, Vec<usize>)>> = Vec::with_capacity(cli.runs);
 
-    // Run the simulation R times
     for run in 0..cli.runs {
-        println!("Starting run {} of {}", run + 1, cli.runs);
-        
         let mut rng: Box<dyn RngCore> = if let Some(seed) = cli.seed {
             Box::new(StdRng::seed_from_u64(seed + run as u64))
         } else {
             Box::new(rand::rng())
         };
-
-        // Create initial sample
-        let (mut tree, mut active_lineages) = create_initial_sample(cli.sample_size);
-
-        // Initialize mutation tracking map (NodeId -> mutation count)
-        let mut mutation_counts: HashMap<NodeId, usize> = HashMap::new();
-
-        // Initialize timing variables for this run
-        let mut mutation_time = Duration::default();
-        let mut stasis_time = Duration::default();
-        let mut binary_time = Duration::default();
-
-        // Initialize generation counter
-        let mut current_gen = 0;
-
-        // Count number of mutation calls
-        let mut mutation_calls = 0;
-
-        while active_lineages.len() > 1 {
-            // Run stasis phase
-            let stasis_start = Instant::now();
-            let (new_gen, mut_time, calls) = stasis(
-                &mut tree,
-                &mut active_lineages,
-                cli.stasis_generations,
-                cli.population_size,
-                current_gen,
+        let (_tree, branch_lengths) = run_single_simulation(
+            cli.sample_size,
+            cli.population_size,
+            cli.bottleneck_size,
+            cli.stasis_generations,
+            &mut rng,
+        );
+        let mutations = draw_mutations(&branch_lengths, cli.mutation_rate, &mut rng);
+        
+        
+        let mut run_subsampled = Vec::new();
+        for depth_file in &cli.depth_files {
+            let depth_dist = read_depth_distribution(depth_file)?;
+            let subsampled = subsample_afs_with_depth(
+                &mutations,
+                cli.sample_size,
+                &depth_dist,
+                cli.min_alt_reads,
+                cli.min_depth,
+                cli.bin_size,
                 &mut rng,
-                cli.mutation_rate,
-                &mut mutation_counts,
-            );
-            current_gen = new_gen;
-            stasis_time += stasis_start.elapsed();
-            mutation_time += mut_time;
-            mutation_calls += calls;
-
-            // Check if we've reached a single lineage after stasis
-            if active_lineages.len() <= 1 {
-                break;
-            }
-
-            // Run binary phase
-            let binary_start = Instant::now();
-            let (new_gen, mut_time, calls) = binary(
-                &mut tree,
-                &mut active_lineages,
-                cli.population_size,
-                current_gen,
-                &mut rng,
-                cli.bottleneck_size,
-                cli.mutation_rate,
-                &mut mutation_counts,
-            );
-            current_gen = new_gen;
-            binary_time += binary_start.elapsed();
-            mutation_time += mut_time;
-            mutation_calls += calls;
+            )?;
+            run_subsampled.push((depth_file.clone(), subsampled));
         }
-
-        if let Some(path) = &cli.output_file {
-            let run_path = if cli.runs > 1 {
-                let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("tree");
-                let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-                path.with_file_name(format!("{}_{}.{}", stem, run, extension))
-            } else {
-                path.clone()
-            };
-            tree.to_file(&run_path).unwrap();
-        }
-
-        // Calculate and export the AFS
-        let afs_start = Instant::now();
+        subsampled_mutations.push(run_subsampled);
         
-        // Always calculate the original AFS first
-        let orig_afs = calculate_afs(&tree, &mutation_counts).unwrap();
-        
-        if !cli.depth_files.is_empty() {
-            // Export original AFS (append mode for runs > 0)
-            let orig_output = cli.output_dir.join("original_afs.csv");
-            append_afs(&orig_afs, &orig_output, AFSType::Absolute, run == 0, run).unwrap();
-            
-            // Process each depth file
-            for depth_file_path in &cli.depth_files {
-                let depth_distribution = read_depth_distribution(depth_file_path).unwrap();
-                
-                // Get depth file stem for naming
-                let depth_file_stem = depth_file_path.file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("depth");
-                
-                // 1. Generate raw subsampled AFS
-                let depth_afs = subsample_afs_with_depth(
-                    &orig_afs,
-                    cli.sample_size,
-                    &depth_distribution,
-                    cli.min_alt_reads,
-                    cli.min_depth,
-                    rng.as_mut(),
-                ).unwrap();
-                
-                // Export raw AFS
-                let raw_output = cli.output_dir.join(format!("afs_{}.csv", depth_file_stem));
-                append_afs(&depth_afs, &raw_output, AFSType::Absolute, run == 0, run).unwrap();
-                
-                // 2. Generate and export folded AFS
-                let folded_afs = fold_afs(&depth_afs);
-                let folded_output = cli.output_dir.join(format!("folded_afs_{}.csv", depth_file_stem));
-                append_afs(&folded_afs, &folded_output, AFSType::Absolute, run == 0, run).unwrap();
-                
-                // 3. Generate binned folded AFS from the folded AFS
-                let binned_afs = bin_folded_afs(&folded_afs, cli.bin_size);
-                
-                // Export binned AFS
-                let binned_output = cli.output_dir.join(format!("binned_folded_afs_{}.csv", depth_file_stem));
-                append_binned_afs(&binned_afs, &binned_output, run == 0, run).unwrap();
-            }
-        } else if let Some(subsample_size) = cli.subsample {
-            // Original subsampling without depth
-            let orig_output = cli.output_dir.join("original_afs.csv");
-            let afs_type = if cli.relative_freq { AFSType::Relative } else { AFSType::Absolute };
-            append_afs(&orig_afs, &orig_output, afs_type, run == 0, run).unwrap();
-            
-            let subsampled_afs = subsample_afs(
-                &orig_afs,
-                cli.sample_size.try_into().unwrap(),
-                subsample_size,
-            ).unwrap();
-            
-            let subsample_output = cli.output_dir.join("subsampled_afs.csv");
-            append_afs(&subsampled_afs, &subsample_output, afs_type, run == 0, run).unwrap();
-        } else {
-            // Just output the original AFS
-            let output_path = cli.output_dir.join("afs.csv");
-            let afs_type = if cli.relative_freq { AFSType::Relative } else { AFSType::Absolute };
-            append_afs(&orig_afs, &output_path, afs_type, run == 0, run).unwrap();
-        }
-
-        let afs_time = afs_start.elapsed();
-        
-        // Accumulate timing statistics
-        total_mutation_time += mutation_time;
-        total_stasis_time += stasis_time;
-        total_binary_time += binary_time;
-        total_afs_time += afs_time;
-        total_mutation_calls += mutation_calls;
-        total_mutations += mutation_counts.values().sum::<usize>();
-        
-        println!("  - Run {} completed with {} mutations", run + 1, mutation_counts.values().sum::<usize>());
+        all_mutations.push(mutations);
+    }
+    
+    let all_mutations_path = cli.output_dir.join("all_mutations.csv");
+    write_all_mutations_csv(&all_mutations, &all_mutations_path)?;
+    
+    
+    if !subsampled_mutations.is_empty() && !subsampled_mutations[0].is_empty() {
+        write_subsampled_mutations_csv(&subsampled_mutations, cli.bin_size, &cli.output_dir)?;
     }
 
-    let total_time = simulation_start.elapsed();
+    let config_path = cli.output_dir.join("config.json");
+    cli.to_json(&config_path)?;
+    Ok(())
+}
 
-    // Print timing results
-    println!("\nAll simulations completed:");
-    println!("  - Number of runs: {}", cli.runs);
-    println!("  - Results saved to: {}", cli.output_dir.display());
-    println!("  - Total mutations across all runs: {}", total_mutations);
-    if !cli.depth_files.is_empty() {
-        println!("  - Processed {} depth distributions", cli.depth_files.len());
-    }
-    println!("\nTiming Statistics (across all runs):");
-    println!("  - Total runtime: {:?}", total_time);
-    println!(
-        "  - Stasis phase: {:?} ({:.2}%)",
-        total_stasis_time,
-        (total_stasis_time.as_secs_f64() / total_time.as_secs_f64()) * 100.0
-    );
-    println!(
-        "  - Binary phase: {:?} ({:.2}%)",
-        total_binary_time,
-        (total_binary_time.as_secs_f64() / total_time.as_secs_f64()) * 100.0
-    );
-    println!(
-        "  - Mutation operations: {:?} ({:.2}%)",
-        total_mutation_time,
-        (total_mutation_time.as_secs_f64() / total_time.as_secs_f64()) * 100.0
-    );
-    println!(
-        "  - AFS calculation: {:?} ({:.2}%)",
-        total_afs_time,
-        (total_afs_time.as_secs_f64() / total_time.as_secs_f64()) * 100.0
-    );
-    println!("  - Number of mutation calls: {}", total_mutation_calls);
-    if total_mutation_calls > 0 {
-        println!(
-            "  - Average time per mutation call: {:?}",
-            total_mutation_time / total_mutation_calls as u32
+fn run_single_simulation(
+    sample_size: u64,
+    population_size: u64,
+    bottleneck_size: u64,
+    stasis_generations: u64,
+    rng: &mut impl RngCore,
+) -> (Tree, HashMap<usize, f64>) {
+    let (mut tree, mut active_lineages) = create_initial_sample(sample_size);
+
+    let mut branch_lengths: HashMap<usize, f64> = HashMap::new();
+
+    let mut current_gen = 0;
+
+    while active_lineages.len() > 1 {
+        current_gen = stasis(
+            &mut tree,
+            &mut active_lineages,
+            stasis_generations,
+            population_size,
+            current_gen,
+            rng,
+            &mut branch_lengths,
+        );
+
+        if active_lineages.len() <= 1 {
+            break;
+        }
+
+        current_gen = binary(
+            &mut tree,
+            &mut active_lineages,
+            current_gen,
+            rng,
+            bottleneck_size,
+            &mut branch_lengths,
         );
     }
 
-    // Save CLI configuration to JSON
-    let config_path = cli.output_dir.join("config.json");
-    if let Ok(config_json) = cli.to_json() {
-        if let Err(e) = std::fs::write(&config_path, config_json) {
-            eprintln!("Warning: Failed to save config to {}: {}", config_path.display(), e);
-        } else {
-            println!("  - Configuration saved to: {}", config_path.display());
-        }
-    } else {
-        eprintln!("Warning: Failed to serialize CLI configuration to JSON");
-    }
+    (tree, branch_lengths)
 }
 
 fn stasis(
@@ -322,12 +282,9 @@ fn stasis(
     population_size: u64,
     current_gen: u64,
     rng: &mut impl Rng,
-    mutation_rate: f64,
-    mutation_counts: &mut HashMap<NodeId, usize>,
-) -> (u64, Duration, usize) {
+    branch_lengths: &mut HashMap<usize, f64>,
+) -> u64 {
     let mut gen = current_gen;
-    let mut total_mutation_time = Duration::default();
-    let mut total_mutation_calls = 0;
 
     for _ in 0..stasis_generations {
         if active_lineages.len() <= 1 {
@@ -336,74 +293,61 @@ fn stasis(
 
         gen += 1;
 
-        // Calculate expected number of coalescences per generation
         let num_lineages = active_lineages.len() as u64;
         let coal_rate = (num_lineages * (num_lineages - 1)) as f64 / (2.0 * population_size as f64);
         let poisson = Poisson::new(coal_rate).unwrap();
         let expected_coals = poisson.sample(rng) as usize;
 
         if expected_coals > 0 {
-            let (new_parents, mutation_time, mutation_calls) = perform_coalescence_with_mutations(
+            let new_parents = coalesce(
                 tree,
                 active_lineages,
                 gen,
                 expected_coals,
-                mutation_rate,
                 rng,
-                mutation_counts,
+                branch_lengths,
             );
             active_lineages.extend(new_parents);
-            total_mutation_time += mutation_time;
-            total_mutation_calls += mutation_calls;
         }
     }
 
-    (gen, total_mutation_time, total_mutation_calls)
+    gen
 }
 
 fn binary(
     tree: &mut Tree,
     active_lineages: &mut Vec<NodeId>,
-    population_size: u64,
     current_gen: u64,
     rng: &mut impl Rng,
     bottleneck_size: u64,
-    mutation_rate: f64,
-    mutation_counts: &mut HashMap<NodeId, usize>,
-) -> (u64, Duration, usize) {
+    branch_lengths: &mut HashMap<usize, f64>,
+) -> u64 {
     let mut gen = current_gen;
-    let mut total_mutation_time = Duration::default();
-    let mut total_mutation_calls = 0;
 
     while active_lineages.len() > 1 {
         gen += 1;
 
-        // Binary phase uses the bottleneck size for population
         let num_lineages = active_lineages.len() as u64;
         let coal_rate = (num_lineages * (num_lineages - 1)) as f64 / (2.0 * bottleneck_size as f64);
         let poisson = Poisson::new(coal_rate).unwrap();
         let expected_coals = poisson.sample(rng) as usize;
 
         if expected_coals > 0 {
-            let (new_parents, mutation_time, mutation_calls) = perform_coalescence_with_mutations(
+            let new_parents = coalesce(
                 tree,
                 active_lineages,
                 gen,
                 expected_coals,
-                mutation_rate,
                 rng,
-                mutation_counts,
+                branch_lengths,
             );
             active_lineages.extend(new_parents);
-            total_mutation_time += mutation_time;
-            total_mutation_calls += mutation_calls;
         }
     }
 
-    (gen, total_mutation_time, total_mutation_calls)
+    gen
 }
 
-// Helper function to create initial samples
 fn create_initial_sample(sample_size: u64) -> (Tree, Vec<NodeId>) {
     let mut tree = Tree::new();
     let mut active_lineages = Vec::with_capacity(sample_size as usize);
@@ -418,18 +362,15 @@ fn create_initial_sample(sample_size: u64) -> (Tree, Vec<NodeId>) {
     (tree, active_lineages)
 }
 
-fn perform_coalescence_with_mutations<R: Rng>(
+fn coalesce<R: Rng>(
     tree: &mut Tree,
     active_lineages: &mut Vec<NodeId>,
     current_generation: u64,
     expected_coals: usize,
-    mutation_rate: f64,
     rng: &mut R,
-    mutation_counts: &mut HashMap<NodeId, usize>,
-) -> (Vec<NodeId>, Duration, usize) {
+    branch_lengths: &mut HashMap<usize, f64>,
+) -> Vec<NodeId> {
     let mut new_parents = Vec::new();
-    let mut mut_times = Vec::new();
-    let mut mutation_calls = 0;
 
     for c in 0..expected_coals {
         if active_lineages.len() <= 1 {
@@ -442,26 +383,12 @@ fn perform_coalescence_with_mutations<R: Rng>(
         let edge1 = current_generation - tree.get(&child1).unwrap().get_depth() as u64;
         let edge2 = current_generation - tree.get(&child2).unwrap().get_depth() as u64;
 
-        // Add mutations to the branches before merging
-        let start = Instant::now();
-        add_branch_mutations(
-            tree,
-            &child1,
-            edge1 as f64,
-            mutation_rate,
-            rng,
-            mutation_counts,
-        );
-        add_branch_mutations(
-            tree,
-            &child2,
-            edge2 as f64,
-            mutation_rate,
-            rng,
-            mutation_counts,
-        );
-        mutation_calls += 2; // Count each call to add_branch_mutations
-        mut_times.push(start.elapsed());
+        // number of leaves for each child node we are coalescing
+        let descendants1 = tree.get_subtree_leaves(&child1).unwrap().len();
+        let descendants2 = tree.get_subtree_leaves(&child2).unwrap().len();
+
+        *branch_lengths.entry(descendants1).or_insert(0.0) += edge1 as f64;
+        *branch_lengths.entry(descendants2).or_insert(0.0) += edge2 as f64;
 
         let parent_id = tree
             .merge_children(
@@ -481,54 +408,30 @@ fn perform_coalescence_with_mutations<R: Rng>(
         new_parents.push(parent_id);
     }
 
-    let mut_time_sum: Duration = if mut_times.is_empty() {
-        Duration::default()
-    } else {
-        mut_times.iter().sum()
-    };
-
-    (new_parents, mut_time_sum, mutation_calls)
+    new_parents
 }
 
-fn add_branch_mutations<R: Rng>(
-    tree: &mut Tree,
-    node_id: &NodeId,
-    branch_length: f64,
+fn draw_mutations<R: Rng>(
+    branch_lengths: &HashMap<usize, f64>,
     mutation_rate: f64,
     rng: &mut R,
-    mutation_counts: &mut HashMap<NodeId, usize>,
-) {
-    // Calculate expected number of mutations on this branch
-    let expected_mutations = branch_length * mutation_rate;
+) -> HashMap<usize, usize> {
+    let mut mutations: HashMap<usize, usize> = HashMap::new();
 
-    // Use Poisson distribution to get the actual number of mutations
-    let poisson = Poisson::new(expected_mutations).unwrap();
-    let num_mutations = poisson.sample(rng) as usize;
+    // Draw mutations in relation to branch lengths
+    // The frequency that a mutation appears at within the population will be
+    // proportional to the number of branch segments that end in number of forks = frequency
+    for (&num_descendants, &total_branch_length) in branch_lengths {
+        let expected_mutations = total_branch_length * mutation_rate;
+        let poisson = Poisson::new(expected_mutations).unwrap();
+        let num_mutations = poisson.sample(rng) as usize;
 
-    if num_mutations > 0 {
-        *mutation_counts.entry(*node_id).or_insert(0) += num_mutations;
-    }
-}
-
-pub fn calculate_afs(
-    tree: &Tree,
-    mutation_counts: &HashMap<NodeId, usize>,
-) -> Result<HashMap<usize, usize>, TreeError> {
-    let sample_size = tree.n_leaves();
-    let mut afs = HashMap::new();
-
-    for (&node, &num_mut) in mutation_counts {
-        // get all the leaves descending from `node` in one shot:
-        let leaves = tree.get_subtree_leaves(&node)?;
-        let k = leaves.len(); // how many leaves carry this mutation
-
-        // only count polymorphic sites (1 ≤ k < sample_size)
-        if (1..sample_size).contains(&k) {
-            *afs.entry(k).or_insert(0) += num_mut;
+        if num_mutations > 0 {
+            mutations.insert(num_descendants, num_mutations);
         }
     }
 
-    Ok(afs)
+    mutations
 }
 
 fn subsample_afs(
@@ -538,9 +441,8 @@ fn subsample_afs(
 ) -> Result<HashMap<usize, usize>> {
     let mut subsampled_afs = HashMap::new();
 
-    
     for (&orig_freq, &variant_count) in original_afs.iter() {
-        let orig_freq = orig_freq as u64; 
+        let orig_freq = orig_freq as u64;
 
         let hyper = Hypergeometric::new(n_original, orig_freq, n_subsample) // (N, K, n)
             .map_err(|e| anyhow!("Hypergeometric::new failed: {}", e))?;
@@ -549,7 +451,6 @@ fn subsample_afs(
         let lower = hyper.min(); // = max(0, n + K - N)
         let upper = hyper.max(); // = min(K, n)
         for x in lower..=upper {
-            
             if x == 0 {
                 continue;
             }
@@ -572,19 +473,18 @@ fn subsample_afs(
     Ok(subsampled_afs)
 }
 
-
-
 fn read_depth_distribution(file_path: &std::path::Path) -> Result<Vec<u32>> {
     let file = File::open(file_path)?;
     let reader = BufReader::new(file);
     let mut depths = Vec::new();
-    
+
     for line in reader.lines() {
         let line = line?;
         // Assuming depth is in the 4th column (0-indexed column 3) of a BED file
         // or just a single depth value per line
         let depth: u32 = if line.contains('\t') {
-            line.split('\t').nth(3)
+            line.split('\t')
+                .nth(3)
                 .ok_or_else(|| anyhow!("Missing depth column"))?
                 .parse()?
         } else {
@@ -592,7 +492,7 @@ fn read_depth_distribution(file_path: &std::path::Path) -> Result<Vec<u32>> {
         };
         depths.push(depth);
     }
-    
+
     Ok(depths)
 }
 
@@ -602,263 +502,55 @@ fn subsample_afs_with_depth(
     depth_distribution: &[u32],
     min_alt_reads: u32,
     min_depth: u32,
-    rng: &mut dyn RngCore,
-) -> Result<HashMap<usize, usize>> {
-    let mut subsampled_afs = HashMap::new();
+    bin_size: f64,
+    rng: &mut impl RngCore,
+) -> Result<Vec<usize>> {
     let uniform = Uniform::new(0.0, 1.0)?;
-    
+    let num_bins = (0.5 / bin_size).ceil() as usize;
+    let mut binned_counts = vec![0; num_bins];
     for (&freq, &variant_count) in original_afs.iter() {
-        let true_frequency = freq as f64 / sample_size as f64;
-        
+        // freq = number of individuals carrying this variant
+        // variant_count = number of independent mutations at this frequency
+
         // For each individual mutation at this frequency
         for _ in 0..variant_count {
-            // Sample a random depth from the distribution
-            let depth_idx = rng.gen_range(0..depth_distribution.len());
-            let depth = depth_distribution[depth_idx];
-            
-            // Skip if depth is too low
+            let depth = *depth_distribution.choose(rng).unwrap();
+
             if depth < min_depth {
                 continue;
             }
-            
-            // Simulate individual reads using uniform random draws
+
+            let alt_probability = freq as f64 / sample_size as f64;
+
             let mut alt_reads = 0;
             for _ in 0..depth {
-                if uniform.sample(rng) < true_frequency {
+                if uniform.sample(rng) < alt_probability {
                     alt_reads += 1;
                 }
             }
-            
-            // Apply detection filters
+
             if alt_reads >= min_alt_reads {
-                let observed_freq = alt_reads as usize;
-                // Only count polymorphic sites (don't include fixed sites)
-                if observed_freq > 0 && observed_freq < depth as usize {
-                    *subsampled_afs.entry(observed_freq).or_insert(0) += 1;
-                }
-            }
-        }
-    }
-    
-    Ok(subsampled_afs)
-}
+                let allele_freq = alt_reads as f64 / depth as f64;
+                let folded_freq = allele_freq.min(1.0 - allele_freq);
 
-fn bin_folded_afs(afs: &HashMap<usize, usize>, bin_size: f64) -> HashMap<String, usize> {
-    let mut binned_mutations = HashMap::new();
-    
-    // Initialize bins from 0 to 0.5 (folded)
-    let mut freq = 0.0;
-    while freq < 0.5 {
-        binned_mutations.insert(format!("{:.3}", freq), 0);
-        freq += bin_size;
-    }
-    
-    // Find the maximum frequency to determine sample size for the folded AFS
-    let max_freq = afs.keys().max().copied().unwrap_or(0);
-    let sample_size = max_freq * 2; // Since this is folded, multiply by 2 to get original sample size
-    
-    for (&freq, &count) in afs {
-        // Convert frequency count back to relative frequency
-        let relative_freq = freq as f64 / sample_size as f64;
-        
-        // Find appropriate bin
-        if relative_freq > 0.0 {
-            let mut bin_freq = 0.0;
-            while bin_freq < 0.5 {
-                if relative_freq >= bin_freq && relative_freq < (bin_freq + bin_size) {
-                    let bin_key = format!("{:.3}", bin_freq);
-                    *binned_mutations.entry(bin_key).or_insert(0) += count;
-                    break;
-                }
-                bin_freq += bin_size;
-            }
-        }
-    }
-    
-    binned_mutations
-}
+                // folded freq should never be ==0.5 but check incase. would go out of bounds of bin vec if is.
+                if folded_freq > 0.0 && folded_freq < 0.5 {
+                    //  bin index using left-closed, right-open intervals [a, b)
+                    let bin_index = (folded_freq / bin_size).floor() as usize;
 
-fn export_afs(
-    data: &dyn std::any::Any,
-    output_path: &std::path::Path,
-    afs_type: AFSType,
-) -> std::io::Result<()> {
-    use std::fs::File;
-    use std::io::Write;
-
-    let mut file = File::create(output_path)?;
-
-    match afs_type {
-        AFSType::Binned => {
-            let binned_afs = data.downcast_ref::<HashMap<String, usize>>()
-                .expect("Expected HashMap<String, usize> for binned AFS");
-            
-            writeln!(file, "frequency_bin,count")?;
-            
-            // Sort by frequency bin
-            let mut bins: Vec<_> = binned_afs.keys().collect();
-            bins.sort_by(|a, b| a.parse::<f64>().unwrap().partial_cmp(&b.parse::<f64>().unwrap()).unwrap());
-
-            for bin in bins {
-                if let Some(&count) = binned_afs.get(bin) {
-                    writeln!(file, "{},{}", bin, count)?;
-                }
-            }
-        }
-        AFSType::Relative | AFSType::Absolute => {
-            let afs = data.downcast_ref::<HashMap<usize, usize>>()
-                .expect("Expected HashMap<usize, usize> for regular AFS");
-
-            let relative = matches!(afs_type, AFSType::Relative);
-            
-            // Calculate total count for relative frequencies if needed
-            let total_count: usize = if relative {
-                afs.values().sum()
-            } else {
-                0
-            };
-
-            // Write header
-            if relative {
-                writeln!(file, "frequency,relative_frequency")?;
-            } else {
-                writeln!(file, "frequency,count")?;
-            }
-
-            let mut freqs: Vec<_> = afs.keys().collect();
-            freqs.sort();
-
-            for &freq in freqs {
-                if let Some(&count) = afs.get(&freq) {
-                    if relative && total_count > 0 {
-                        let rel_freq = count as f64 / total_count as f64;
-                        writeln!(file, "{},{:.6}", freq, rel_freq)?;
-                    } else {
-                        writeln!(file, "{},{}", freq, count)?;
-                    }
+                    binned_counts[bin_index] += 1;
                 }
             }
         }
     }
 
-    Ok(())
-}
-
-// Remove the export_binned_afs function entirely
-
-fn fold_afs(afs: &HashMap<usize, usize>) -> HashMap<usize, usize> {
-    let mut folded = HashMap::new();
-    
-    // Find the maximum frequency to determine sample size
-    let max_freq = afs.keys().max().copied().unwrap_or(0);
-    let sample_size = max_freq + 1;
-    
-    for (&freq, &count) in afs {
-        // For folded AFS, we take the minimum of freq and (sample_size - freq)
-        // This matches the C++ logic: if freq > sample_size/2, fold it
-        let folded_freq = if freq > sample_size / 2 {
-            sample_size - freq
-        } else {
-            freq
-        };
-        
-        // Only include if folded_freq > 0 (exclude monomorphic sites)
-        if folded_freq > 0 {
-            *folded.entry(folded_freq).or_insert(0) += count;
-        }
-    }
-    
-    folded
+    Ok(binned_counts)
 }
 
 fn remove_random<T, R: Rng>(vec: &mut Vec<T>, rng: &mut R) -> Option<T> {
     if vec.is_empty() {
         return None;
     }
-    let idx = rng.gen_range(0..vec.len());
+    let idx = rng.random_range(0..vec.len());
     Some(vec.swap_remove(idx))
-}
-
-fn append_afs(
-    afs: &HashMap<usize, usize>,
-    output_path: &std::path::Path,
-    afs_type: AFSType,
-    write_header: bool,
-    run_id: u32,
-) -> std::io::Result<()> {
-    use std::fs::OpenOptions;
-    use std::io::Write;
-
-    let mut file = if write_header {
-        std::fs::File::create(output_path)?
-    } else {
-        OpenOptions::new().create(true).append(true).open(output_path)?
-    };
-
-    let relative = matches!(afs_type, AFSType::Relative);
-    
-    // Calculate total count for relative frequencies if needed
-    let total_count: usize = if relative {
-        afs.values().sum()
-    } else {
-        0
-    };
-
-    // Write header only for first run
-    if write_header {
-        if relative {
-            writeln!(file, "run,frequency,relative_frequency")?;
-        } else {
-            writeln!(file, "run,frequency,count")?;
-        }
-    }
-
-    let mut freqs: Vec<_> = afs.keys().collect();
-    freqs.sort();
-
-    for &freq in freqs {
-        if let Some(&count) = afs.get(&freq) {
-            if relative && total_count > 0 {
-                let rel_freq = count as f64 / total_count as f64;
-                writeln!(file, "{},{},{:.6}", run_id, freq, rel_freq)?;
-            } else {
-                writeln!(file, "{},{},{}", run_id, freq, count)?;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn append_binned_afs(
-    binned_afs: &HashMap<String, usize>,
-    output_path: &std::path::Path,
-    write_header: bool,
-    run_id: u32,
-) -> std::io::Result<()> {
-    use std::fs::OpenOptions;
-    use std::io::Write;
-
-    let mut file = if write_header {
-        std::fs::File::create(output_path)?
-    } else {
-        OpenOptions::new().create(true).append(true).open(output_path)?
-    };
-
-    // Write header only for first run
-    if write_header {
-        writeln!(file, "run,frequency_bin,count")?;
-    }
-    
-    // Sort by frequency bin
-    let mut bins: Vec<_> = binned_afs.keys().collect();
-    bins.sort_by(|a, b| a.parse::<f64>().unwrap().partial_cmp(&b.parse::<f64>().unwrap()).unwrap());
-
-    for bin in bins {
-        if let Some(&count) = binned_afs.get(bin) {
-            writeln!(file, "{},{},{}", run_id, bin, count)?;
-        }
-    }
-
-    Ok(())
 }
