@@ -3,9 +3,20 @@ use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
 use tempfile::TempDir;
+use std::sync::Once;
+
+static INIT: Once = Once::new();
+
+/// Setup function that is only run once, even if called multiple times.
+fn setup() {
+    INIT.call_once(|| {
+        env_logger::init();
+    });
+}
 
 #[test]
 fn without_depth() {
+    setup();
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let output_dir = temp_dir.path().join("test_output");
 
@@ -52,6 +63,7 @@ fn without_depth() {
 
 #[test]
 fn with_depth() {
+    setup();
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let output_dir = temp_dir.path().join("test_output");
 
@@ -88,7 +100,7 @@ fn with_depth() {
     .success();
 
     assert!(output_dir.join("all_mutations.csv").exists());
-    assert!(output_dir.join("subsampled_mutations.csv").exists());
+    assert!(output_dir.join("depths_subsampled_mutations.csv").exists());
     assert!(output_dir.join("config.json").exists());
 
     println!("\n=== all_mutations.csv ===");
@@ -99,9 +111,9 @@ fn with_depth() {
         }
     }
 
-    println!("\n=== subsampled_mutations.csv ===");
+    println!("\n=== depths_subsampled_mutations.csv ===");
     let subsampled_content =
-        fs::read_to_string(output_dir.join("subsampled_mutations.csv")).unwrap();
+        fs::read_to_string(output_dir.join("depths_subsampled_mutations.csv")).unwrap();
     for (i, line) in subsampled_content.lines().enumerate() {
         if i < 10 {
             println!("{}", line);
