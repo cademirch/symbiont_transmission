@@ -1,9 +1,9 @@
-use anyhow::{anyhow,  Result};
+use anyhow::{anyhow, Result};
 use clap::Parser;
 use rand::prelude::*;
 use rand::RngCore;
 use rand::SeedableRng;
-use rand_distr::{Distribution, Poisson, Binomial, Hypergeometric};
+use rand_distr::{Binomial, Distribution, Hypergeometric, Poisson};
 use rand_xoshiro::Xoshiro128StarStar;
 use serde::{Deserialize, Serialize};
 // use statrs::distribution::{Discrete, Hypergeometric};
@@ -44,13 +44,6 @@ struct Cli {
 
     #[arg(long)]
     seed: Option<u64>,
-
-    #[arg(
-        short = 'r',
-        long,
-        help = "Output relative frequencies instead of absolute counts"
-    )]
-    relative_freq: bool,
 
     #[arg(short = 's', long)]
     subsample: Option<u64>,
@@ -93,8 +86,6 @@ struct Cli {
         help = "Number of simulation runs"
     )]
     runs: usize,
-
-    
 }
 
 impl Cli {
@@ -246,16 +237,15 @@ fn main() -> Result<()> {
         Cli::parse()
     };
 
-    
-
     std::fs::create_dir_all(&cli.output_dir).unwrap();
 
     let mut all_mutations: Vec<HashMap<usize, usize>> = Vec::with_capacity(cli.runs);
-    let mut subsampled_mutations: Vec<Vec<(PathBuf, Vec<(u32,u32)>)>> = Vec::with_capacity(cli.runs);
+    let mut subsampled_mutations: Vec<Vec<(PathBuf, Vec<(u32, u32)>)>> =
+        Vec::with_capacity(cli.runs);
 
     for run in 0..cli.runs {
         println!("Starting simulation run {}/{}", run + 1, cli.runs);
-        
+
         let mut rng: Box<dyn RngCore> = if let Some(seed) = cli.seed {
             Box::new(Xoshiro128StarStar::seed_from_u64(seed + run as u64))
         } else {
@@ -361,9 +351,13 @@ fn stasis(
 
         gen += 1;
 
-        
         if gen % 100 == 0 {
-            println!("Stasis phase - Generation: {}/{}, Active lineages: {}", gen, stasis_generations, active_lineages.len());
+            println!(
+                "Stasis phase - Generation: {}/{}, Active lineages: {}",
+                gen,
+                stasis_generations,
+                active_lineages.len()
+            );
         }
 
         let num_lineages = active_lineages.len() as u64;
@@ -400,9 +394,12 @@ fn binary(
     while active_lineages.len() > 1 {
         gen += 1;
 
-        
         if gen % 10 == 0 {
-            println!("Bottleneck phase - Generation: {}, Active lineages: {}", gen, active_lineages.len());
+            println!(
+                "Bottleneck phase - Generation: {}, Active lineages: {}",
+                gen,
+                active_lineages.len()
+            );
         }
 
         let num_lineages = active_lineages.len() as u64;
@@ -530,11 +527,11 @@ fn subsample_afs(
         //         continue;
         //     }
 
-            // let expected = (variant_count as f64) * p;
-            // let count = expected.round() as usize;
-            // if count > 0 {
-            //     *subsampled_afs.entry(x as usize).or_insert(0) += count;
-            // }
+        // let expected = (variant_count as f64) * p;
+        // let count = expected.round() as usize;
+        // if count > 0 {
+        //     *subsampled_afs.entry(x as usize).or_insert(0) += count;
+        // }
         // }
     }
 
@@ -580,14 +577,13 @@ fn subsample_afs_with_depth(
         let ref_allele_count = sample_size - alt_allele_count;
 
         for _ in 0..variant_count {
-
-            let depth = *depth_distribution.choose(rng)
+            let depth = *depth_distribution
+                .choose(rng)
                 .ok_or_else(|| anyhow!("Empty depth distribution"))?;
 
             if depth < min_depth {
                 continue;
             }
-
 
             // Hypergeometric parameters:
             // - Total population size: sample_size
@@ -598,13 +594,18 @@ fn subsample_afs_with_depth(
             // Note: Hypergeometric requires depth <= sample_size
             let effective_depth = depth.min(sample_size as u32) as u64;
 
-            let hypergeom = Hypergeometric::new(
-                sample_size,        // total population
-                alt_allele_count,   // success states in population
-                effective_depth     // number of draws
-            )?;
+            // let hypergeom = Hypergeometric::new(
+            //     sample_size,      // total population
+            //     alt_allele_count, // success states in population
+            //     effective_depth,  // number of draws
+            // )?;
 
-            let alt_reads = hypergeom.sample(rng) as u32;
+            let alt_reads = sample_hypergeometric_stable(
+                    sample_size,
+                    alt_allele_count,
+                    effective_depth,
+                    rng,
+                )?;
 
             if alt_reads >= min_alt_reads {
                 detectable_mutations.push((depth, alt_reads));
@@ -615,4 +616,43 @@ fn subsample_afs_with_depth(
     Ok(detectable_mutations)
 }
 
-
+fn sample_hypergeometric_stable(
+    population_size: u64,
+    success_states: u64,
+    draws: u64,
+    rng: &mut impl RngCore,
+) -> Result<u32> {
+    if draws == 0 {
+        return Ok(0);
+    }
+    
+    if success_states == 0 {
+        return Ok(0);
+    }
+    
+    if draws >= population_size {
+        return Ok(success_states as u32);
+    }
+    
+    // Sequential sampling: for each draw, calculate probability of drawing success
+    let mut successes = 0;
+    let mut remaining_success = success_states;
+    let mut remaining_population = population_size;
+    
+    for _ in 0..draws {
+        let prob = remaining_success as f64 / remaining_population as f64;
+        
+        if rng.gen::<f64>() < prob {
+            successes += 1;
+            remaining_success -= 1;
+        }
+        
+        remaining_population -= 1;
+        
+        if remaining_success == 0 {
+            break;
+        }
+    }
+    
+    Ok(successes)
+}

@@ -48,7 +48,7 @@ def sample_parameters():
 
 rule all:
     input:
-        expand("param_set_{param_set}/config.json", param_set=range(N_PARAM_SETS)),
+        expand("results/{param_set}/", param_set=range(N_PARAM_SETS)),
 
 
 rule generate_all_params:
@@ -86,9 +86,9 @@ rule run_sim:
         simulator=rules.build_simulator.output.binary,
         params_json="parameter_sets.json",
     output:
-        config="param_set_{param_set}/config.json",
+        muts=directory("results/{param_set}/"),
     log:
-        "param_set_{param_set}/log.txt",
+        "logs/{param_set}.txt",
     threads: 1
     run:
         import json
@@ -99,18 +99,18 @@ rule run_sim:
         param_data = param_file["parameter_sets"][int(wildcards.param_set)]
 
         # Create output directory
-        shell(f"mkdir -p param_set_{wildcards.param_set}")
+        
 
         depth_files_str = ",".join(str(p) for p in DEPTH_FILES)
 
         cmd_args = [
             str(input.simulator),
-            "--sample-size", "10000000",
+            "--sample-size", "1000000",
             "--population-size", str(param_data['N']),
             "--bottleneck-size", str(param_data['Nb']),
             "--stasis-generations", str(param_data['Gs']),
             "--mutation-rate", str(param_data['u_total']),
-            "--output-dir", f"param_set_{wildcards.param_set}",  
+            "--output-dir", f"{output.muts}",  
             "--runs", str(N_REPLICATES),
             "--seed", str(param_data['sim_seed']),
             "--depth-files", depth_files_str
