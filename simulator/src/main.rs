@@ -573,8 +573,6 @@ fn subsample_afs_with_depth(
 
     for (&freq, &variant_count) in original_afs.iter() {
         let alt_probability = freq as f64 / sample_size as f64;
-        let alt_allele_count = freq as u64;
-        let ref_allele_count = sample_size - alt_allele_count;
 
         for _ in 0..variant_count {
             let depth = *depth_distribution
@@ -585,27 +583,19 @@ fn subsample_afs_with_depth(
                 continue;
             }
 
-            // Hypergeometric parameters:
-            // - Total population size: sample_size
-            // - Success states (alt alleles): alt_allele_count
-            // - Failure states (ref alleles): ref_allele_count
-            // - Number of draws: depth
-
-            // Note: Hypergeometric requires depth <= sample_size
-            let effective_depth = depth.min(sample_size as u32) as u64;
-
-            // let hypergeom = Hypergeometric::new(
-            //     sample_size,      // total population
-            //     alt_allele_count, // success states in population
-            //     effective_depth,  // number of draws
-            // )?;
-
-            let alt_reads = sample_hypergeometric_stable(
-                    sample_size,
-                    alt_allele_count,
-                    effective_depth,
-                    rng,
-                )?;
+            // Binomial distribution: each read has probability alt_probability 
+            // of being an alt allele, independently across depth reads.
+            // 
+            // Note: Biologically, sequencing is sampling without replacement 
+            // (there are a finite number of alleles in the sample), which would 
+            // be modeled by a hypergeometric distribution. However, when 
+            // sample_size >>> depth (typically sample_size is in the thousands 
+            // while depth is 10-1000x), the draws become essentially independent
+            // and the binomial approximation is accurate. This is analogous to
+            // how sampling a few balls from a very large urn approximates 
+            // sampling with replacement.
+            let binomial = Binomial::new(depth as u64, alt_probability)?;
+            let alt_reads = binomial.sample(rng) as u32;
 
             if alt_reads >= min_alt_reads {
                 detectable_mutations.push((depth, alt_reads));
