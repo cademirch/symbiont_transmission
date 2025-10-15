@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use clap::Parser;
+use log::{debug, info};
 use rand::prelude::*;
 use rand::RngCore;
 use rand::SeedableRng;
@@ -275,30 +276,34 @@ fn write_mutations_csv(all_runs: &[SubsampledMutations], output_prefix: &PathBuf
         }
     }
 
-    println!("Wrote results to:");
-    println!("  - {}", circles_path.display());
-    println!("  - {}", duplex_path.display());
-    println!("  - {}", shared_path.display());
+    info!("Wrote results to:");
+    info!("  - {}", circles_path.display());
+    info!("  - {}", duplex_path.display());
+    info!("  - {}", shared_path.display());
 
     Ok(())
 }
 
 fn main() -> Result<()> {
+    env_logger::Builder::from_default_env()
+        .filter_level(log::LevelFilter::Debug)
+        .init();
+
     let cli = Cli::parse();
 
     let circles_dist = serde_json::from_str::<DepthDistribution>(CIRCLES_JSON)?;
     let duplex_dist = serde_json::from_str::<DepthDistribution>(DUPLEX_JSON)?;
 
-    println!("Circles distribution:");
-    println!(
+    info!("Circles distribution:");
+    info!(
         "  Mean: {:.1}, Median: {}, Range: [{}, {}]",
         circles_dist.stats().mean,
         circles_dist.stats().median,
         circles_dist.stats().min,
         circles_dist.stats().max
     );
-    println!("Duplex distribution:");
-    println!(
+    info!("Duplex distribution:");
+    info!(
         "  Mean: {:.1}, Median: {}, Range: [{}, {}]",
         duplex_dist.stats().mean,
         duplex_dist.stats().median,
@@ -309,7 +314,7 @@ fn main() -> Result<()> {
     let mut all_subsampled: Vec<SubsampledMutations> = Vec::with_capacity(cli.runs);
 
     for run in 0..cli.runs {
-        println!("\nStarting simulation run {}/{}", run + 1, cli.runs);
+        info!("Starting simulation run {}/{}", run + 1, cli.runs);
 
         let mut rng: Box<dyn RngCore> = if let Some(seed) = cli.seed {
             Box::new(Xoshiro128StarStar::seed_from_u64(seed + run as u64))
@@ -339,7 +344,7 @@ fn main() -> Result<()> {
             &mut rng,
         )?;
 
-        println!(
+        info!(
             "  Circles: {} detected, Duplex: {} detected, Shared: {} detected",
             subsampled.circles.len(),
             subsampled.duplex.len(),
@@ -349,10 +354,10 @@ fn main() -> Result<()> {
         all_subsampled.push(subsampled);
     }
 
-    println!("\nWriting output files...");
+    info!("Writing output files...");
     write_mutations_csv(&all_subsampled, &cli.output_prefix)?;
 
-    println!("\n✓ Simulation complete!");
+    info!("✓ Simulation complete!");
     Ok(())
 }
 
@@ -416,7 +421,7 @@ fn stasis(
         gen += 1;
 
         if gen % 100 == 0 {
-            println!(
+            debug!(
                 "Stasis phase - Generation: {}/{}, Active lineages: {}",
                 gen,
                 stasis_generations,
@@ -459,7 +464,7 @@ fn binary(
         gen += 1;
 
         if gen % 10 == 0 {
-            println!(
+            debug!(
                 "Bottleneck phase - Generation: {}, Active lineages: {}",
                 gen,
                 active_lineages.len()
