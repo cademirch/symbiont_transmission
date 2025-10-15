@@ -6,21 +6,100 @@ use rand::SeedableRng;
 use rand_distr::{Binomial, Distribution, Hypergeometric, Poisson};
 use rand_xoshiro::Xoshiro128StarStar;
 use serde::{Deserialize, Serialize};
-// use statrs::distribution::{Discrete, Hypergeometric};
-
-use statrs::statistics::{Max, Min};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+const CIRCLES_JSON: &str = include_str!("../data/circles_depth_cdf.json");
+const DUPLEX_JSON: &str = include_str!("../data/duplex_depth_cdf.json");
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DepthStats {
+    pub mean: f64,
+    pub median: u32,
+    pub min: u32,
+    pub max: u32,
+    pub total_sites: usize,
+    pub unique_depths: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DepthDistribution {
+    cdf: Vec<(u32, f64)>,
+    stats: DepthStats,
+}
+
+impl DepthDistribution {
+    pub fn from_json(path: impl AsRef<Path>) -> Result<Self> {
+        #[derive(Deserialize)]
+        struct JsonFormat {
+            cdf: Vec<[f64; 2]>,
+            stats: DepthStats,
+        }
+
+        let file = File::open(path)?;
+        let reader = BufReader::new(file);
+        let json: JsonFormat = serde_json::from_reader(reader)?;
+
+        // Convert from [[depth, prob], ...] to Vec<(u32, f64)>
+        let cdf = json
+            .cdf
+            .into_iter()
+            .map(|[depth, prob]| (depth as u32, prob))
+            .collect();
+
+        Ok(Self {
+            cdf,
+            stats: json.stats,
+        })
+    }
+
+    pub fn sample(&self, rng: &mut impl RngCore) -> u32 {
+        let u: f64 = rng.random();
+
+        match self
+            .cdf
+            .binary_search_by(|(_, prob)| prob.partial_cmp(&u).unwrap_or(std::cmp::Ordering::Equal))
+        {
+            Ok(idx) => self.cdf[idx].0,
+            Err(idx) => self
+                .cdf
+                .get(idx)
+                .map(|(d, _)| *d)
+                .unwrap_or(self.cdf.last().unwrap().0),
+        }
+    }
+
+    pub fn stats(&self) -> &DepthStats {
+        &self.stats
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Mutation {
+    depth: u32,
+    alt_count: u32,
+}
+
+#[derive(Debug, Clone)]
+struct SharedMutation {
+    circles_depth: u32,
+    circles_alt: u32,
+    duplex_depth: u32,
+    duplex_alt: u32,
+}
+
+struct SubsampledMutations {
+    circles: Vec<Mutation>,
+    duplex: Vec<Mutation>,
+    shared: Vec<SharedMutation>,
+}
 
 #[derive(Parser, Serialize, Deserialize)]
 #[command(version, about, long_about = None)]
 struct Cli {
-    #[arg(long, help = "Load configuration from JSON file")]
-    config: Option<PathBuf>,
-
     #[arg(short = 'n', long)]
     sample_size: u64,
 
@@ -36,24 +115,8 @@ struct Cli {
     #[arg(short = 'u', long)]
     mutation_rate: f64,
 
-    #[arg(short = 'o', long)]
-    output_file: Option<PathBuf>,
-
-    #[arg(short = 'a', long, default_value = "afs.csv")]
-    afs_output: PathBuf,
-
     #[arg(long)]
     seed: Option<u64>,
-
-    #[arg(short = 's', long)]
-    subsample: Option<u64>,
-
-    #[arg(
-        long,
-        help = "Paths to files containing depth distributions",
-        value_delimiter = ','
-    )]
-    depth_files: Vec<PathBuf>,
 
     #[arg(
         long,
@@ -69,15 +132,22 @@ struct Cli {
     )]
     min_depth: u32,
 
-    #[arg(long, default_value = "output", help = "Output directory for results")]
-    output_dir: PathBuf,
+    #[arg(
+        long,
+        default_value = "10",
+        help = "Minimum depth required for circles variant calling"
+    )]
+    min_depth_circles: u32,
 
     #[arg(
         long,
-        default_value = "0.05",
-        help = "Bin size for folded AFS relative frequencies"
+        default_value = "10",
+        help = "Minimum depth required for duplex variant calling"
     )]
-    bin_size: f64,
+    min_depth_duplex: u32,
+
+    #[arg(long, default_value = "output", help = "Output prefix for results")]
+    output_prefix: PathBuf,
 
     #[arg(
         short = 'R',
@@ -86,23 +156,6 @@ struct Cli {
         help = "Number of simulation runs"
     )]
     runs: usize,
-}
-
-impl Cli {
-    pub fn to_json(&self, file_path: &PathBuf) -> Result<()> {
-        let json_string = serde_json::to_string_pretty(self)
-            .map_err(|e| anyhow!("Failed to serialize CLI to JSON: {}", e))?;
-
-        let mut file = File::create(file_path)?;
-        write!(file, "{}", json_string)?;
-
-        Ok(())
-    }
-    fn from_config(config_path: &PathBuf) -> Result<Self> {
-        let config_str = std::fs::read_to_string(config_path)?;
-        let cli: Cli = serde_json::from_str(&config_str)?;
-        Ok(cli)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -172,79 +225,91 @@ impl SimpleTree {
     }
 }
 
-fn write_all_mutations_csv(
-    all_mutations: &[HashMap<usize, usize>],
-    file_path: &PathBuf,
-) -> Result<()> {
-    let mut file = File::create(file_path)?;
+fn write_mutations_csv(all_runs: &[SubsampledMutations], output_prefix: &PathBuf) -> Result<()> {
+    let circles_path = PathBuf::from(format!("{}_circles.csv", output_prefix.display()));
+    let mut circles_file = File::create(&circles_path)?;
+    writeln!(circles_file, "run,depth,alt_count")?;
 
-    writeln!(file, "run,allele_freq,num_observed")?;
-
-    for (run_idx, mutations) in all_mutations.iter().enumerate() {
-        for (&allele_freq, &num_observed) in mutations.iter() {
-            writeln!(file, "{},{},{}", run_idx, allele_freq, num_observed)?;
+    for (run_idx, run_mutations) in all_runs.iter().enumerate() {
+        for mutation in &run_mutations.circles {
+            writeln!(
+                circles_file,
+                "{},{},{}",
+                run_idx, mutation.depth, mutation.alt_count
+            )?;
         }
     }
 
-    Ok(())
-}
+    let duplex_path = PathBuf::from(format!("{}_duplex.csv", output_prefix.display()));
+    let mut duplex_file = File::create(&duplex_path)?;
+    writeln!(duplex_file, "run,depth,alt_count")?;
 
-fn write_subsampled_mutations_csv(
-    subsampled_mutations: &[Vec<(PathBuf, Vec<(u32, u32)>)>],
-    output_dir: &PathBuf,
-) -> Result<()> {
-    let mut depth_file_data: HashMap<PathBuf, Vec<(usize, Vec<(u32, u32)>)>> = HashMap::new();
-
-    for (run_idx, run_data) in subsampled_mutations.iter().enumerate() {
-        for (depth_file, mutations) in run_data {
-            depth_file_data
-                .entry(depth_file.clone())
-                .or_insert_with(Vec::new)
-                .push((run_idx, mutations.clone()));
+    for (run_idx, run_mutations) in all_runs.iter().enumerate() {
+        for mutation in &run_mutations.duplex {
+            writeln!(
+                duplex_file,
+                "{},{},{}",
+                run_idx, mutation.depth, mutation.alt_count
+            )?;
         }
     }
 
-    for (depth_file, run_data) in depth_file_data {
-        let depth_file_stem = depth_file
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown");
+    let shared_path = PathBuf::from(format!("{}_shared.csv", output_prefix.display()));
+    let mut shared_file = File::create(&shared_path)?;
+    writeln!(
+        shared_file,
+        "run,circles_depth,circles_alt,duplex_depth,duplex_alt"
+    )?;
 
-        let output_path = output_dir.join(format!("{}_subsampled_mutations.csv", depth_file_stem));
-        let mut file = File::create(&output_path)?;
-
-        writeln!(file, "run,depth,alt_count")?;
-
-        for (run_idx, mutations) in run_data {
-            for &(depth, alt_count) in mutations.iter() {
-                writeln!(file, "{},{},{}", run_idx, depth, alt_count)?;
-            }
+    for (run_idx, run_mutations) in all_runs.iter().enumerate() {
+        for mutation in &run_mutations.shared {
+            writeln!(
+                shared_file,
+                "{},{},{},{},{}",
+                run_idx,
+                mutation.circles_depth,
+                mutation.circles_alt,
+                mutation.duplex_depth,
+                mutation.duplex_alt
+            )?;
         }
     }
+
+    println!("Wrote results to:");
+    println!("  - {}", circles_path.display());
+    println!("  - {}", duplex_path.display());
+    println!("  - {}", shared_path.display());
 
     Ok(())
 }
 
 fn main() -> Result<()> {
-    let cli = if let Some(config_path) = std::env::args().find(|arg| arg == "--config") {
-        // Get the config file path (next argument)
-        let config_file = std::env::args()
-            .nth(std::env::args().position(|x| x == "--config").unwrap() + 1)
-            .ok_or_else(|| anyhow!("Config file path required after --config"))?;
+    let cli = Cli::parse();
 
-        Cli::from_config(&PathBuf::from(config_file))?
-    } else {
-        Cli::parse()
-    };
+    let circles_dist = serde_json::from_str::<DepthDistribution>(CIRCLES_JSON)?;
+    let duplex_dist = serde_json::from_str::<DepthDistribution>(DUPLEX_JSON)?;
 
-    std::fs::create_dir_all(&cli.output_dir).unwrap();
+    println!("Circles distribution:");
+    println!(
+        "  Mean: {:.1}, Median: {}, Range: [{}, {}]",
+        circles_dist.stats().mean,
+        circles_dist.stats().median,
+        circles_dist.stats().min,
+        circles_dist.stats().max
+    );
+    println!("Duplex distribution:");
+    println!(
+        "  Mean: {:.1}, Median: {}, Range: [{}, {}]",
+        duplex_dist.stats().mean,
+        duplex_dist.stats().median,
+        duplex_dist.stats().min,
+        duplex_dist.stats().max
+    );
 
-    let mut all_mutations: Vec<HashMap<usize, usize>> = Vec::with_capacity(cli.runs);
-    let mut subsampled_mutations: Vec<Vec<(PathBuf, Vec<(u32, u32)>)>> =
-        Vec::with_capacity(cli.runs);
+    let mut all_subsampled: Vec<SubsampledMutations> = Vec::with_capacity(cli.runs);
 
     for run in 0..cli.runs {
-        println!("Starting simulation run {}/{}", run + 1, cli.runs);
+        println!("\nStarting simulation run {}/{}", run + 1, cli.runs);
 
         let mut rng: Box<dyn RngCore> = if let Some(seed) = cli.seed {
             Box::new(Xoshiro128StarStar::seed_from_u64(seed + run as u64))
@@ -252,6 +317,7 @@ fn main() -> Result<()> {
             let mut thread_rng = rand::rng();
             Box::new(Xoshiro128StarStar::from_rng(&mut thread_rng))
         };
+
         let (_tree, branch_lengths) = run_single_simulation(
             cli.sample_size,
             cli.population_size,
@@ -259,36 +325,34 @@ fn main() -> Result<()> {
             cli.stasis_generations,
             &mut rng,
         );
+
         let mutations = draw_mutations(&branch_lengths, cli.mutation_rate, &mut rng);
 
-        let mut run_subsampled = Vec::new();
-        for depth_file in &cli.depth_files {
-            let mut depth_dist = read_depth_distribution(depth_file)?;
-            let subsampled = subsample_afs_with_depth(
-                &mutations,
-                cli.sample_size,
-                &mut depth_dist,
-                cli.min_alt_reads,
-                cli.min_depth,
-                &mut rng,
-            )?;
-            run_subsampled.push((depth_file.clone(), subsampled));
-        }
-        subsampled_mutations.push(run_subsampled);
+        let subsampled = subsample_afs_with_depth(
+            &mutations,
+            cli.sample_size,
+            &circles_dist,
+            &duplex_dist,
+            cli.min_alt_reads,
+            cli.min_depth_circles,
+            cli.min_depth_duplex,
+            &mut rng,
+        )?;
 
-        all_mutations.push(mutations);
-        println!("Completed simulation run {}/{}", run + 1, cli.runs);
+        println!(
+            "  Circles: {} detected, Duplex: {} detected, Shared: {} detected",
+            subsampled.circles.len(),
+            subsampled.duplex.len(),
+            subsampled.shared.len()
+        );
+
+        all_subsampled.push(subsampled);
     }
 
-    let all_mutations_path = cli.output_dir.join("all_mutations.csv");
-    write_all_mutations_csv(&all_mutations, &all_mutations_path)?;
+    println!("\nWriting output files...");
+    write_mutations_csv(&all_subsampled, &cli.output_prefix)?;
 
-    if !subsampled_mutations.is_empty() && !subsampled_mutations[0].is_empty() {
-        write_subsampled_mutations_csv(&subsampled_mutations, &cli.output_dir)?;
-    }
-
-    let config_path = cli.output_dir.join("config.json");
-    cli.to_json(&config_path)?;
+    println!("\n✓ Simulation complete!");
     Ok(())
 }
 
@@ -499,150 +563,74 @@ fn draw_mutations<R: Rng>(
     mutations
 }
 
-fn subsample_afs(
-    original_afs: &HashMap<usize, usize>,
-    n_original: u64,
-    n_subsample: u64,
-) -> Result<HashMap<usize, usize>> {
-    let mut subsampled_afs = HashMap::new();
-
-    for (&orig_freq, &variant_count) in original_afs.iter() {
-        let orig_freq = orig_freq as u64;
-
-        let hyper = Hypergeometric::new(n_original, orig_freq, n_subsample) // (N, K, n)
-            .map_err(|e| anyhow!("Hypergeometric::new failed: {}", e))?;
-
-        // iterate over possible subsample counts x
-        // let lower = hyper.min(); // = max(0, n + K - N)
-        // let upper = hyper.max(); // = min(K, n)
-        // for x in lower..=upper {
-        //     if x == 0 {
-        //         continue;
-        //     }
-
-        //     // log-PMF is stable
-        //     let logp = hyper.ln_pmf(x);
-        //     let p = logp.exp(); // back to probability space
-        //     if !p.is_finite() {
-        //         continue;
-        //     }
-
-        // let expected = (variant_count as f64) * p;
-        // let count = expected.round() as usize;
-        // if count > 0 {
-        //     *subsampled_afs.entry(x as usize).or_insert(0) += count;
-        // }
-        // }
-    }
-
-    Ok(subsampled_afs)
-}
-
-fn read_depth_distribution(file_path: &std::path::Path) -> Result<Vec<u32>> {
-    let file = File::open(file_path)?;
-    let reader = BufReader::new(file);
-    let mut depths = Vec::new();
-
-    for line in reader.lines() {
-        let line = line?;
-        // Assuming depth is in the 4th column (0-indexed column 3) of a BED file
-        // or just a single depth value per line
-        let depth: u32 = if line.contains('\t') {
-            line.split('\t')
-                .nth(3)
-                .ok_or_else(|| anyhow!("Missing depth column"))?
-                .parse()?
-        } else {
-            line.trim().parse()?
-        };
-        depths.push(depth);
-    }
-
-    Ok(depths)
-}
-
 fn subsample_afs_with_depth(
     original_afs: &HashMap<usize, usize>,
     sample_size: u64,
-    depth_distribution: &mut [u32],
+    circles_depth_dist: &DepthDistribution,
+    duplex_depth_dist: &DepthDistribution,
     min_alt_reads: u32,
-    min_depth: u32,
+    min_depth_circles: u32,
+    min_depth_duplex: u32,
     rng: &mut impl RngCore,
-) -> Result<Vec<(u32, u32)>> {
-    let mut detectable_mutations = Vec::new();
+) -> Result<SubsampledMutations> {
+    let mut circles = Vec::new();
+    let mut duplex = Vec::new();
+    let mut shared = Vec::new();
 
     for (&freq, &variant_count) in original_afs.iter() {
         let alt_probability = freq as f64 / sample_size as f64;
 
         for _ in 0..variant_count {
-            let depth = *depth_distribution
-                .choose(rng)
-                .ok_or_else(|| anyhow!("Empty depth distribution"))?;
+            let circles_depth = circles_depth_dist.sample(rng);
+            let duplex_depth = duplex_depth_dist.sample(rng);
 
-            if depth < min_depth {
-                continue;
+            // Check circles detection
+            let circles_alt = if circles_depth >= min_depth_circles {
+                let binomial = Binomial::new(circles_depth as u64, alt_probability)?;
+                binomial.sample(rng) as u32
+            } else {
+                0
+            };
+
+            // Check duplex detection
+            let duplex_alt = if duplex_depth >= min_depth_duplex {
+                let binomial = Binomial::new(duplex_depth as u64, alt_probability)?;
+                binomial.sample(rng) as u32
+            } else {
+                0
+            };
+
+            let circles_detected = circles_alt >= min_alt_reads;
+            let duplex_detected = duplex_alt >= min_alt_reads;
+
+            if circles_detected {
+                circles.push(Mutation {
+                    depth: circles_depth,
+                    alt_count: circles_alt,
+                });
             }
 
-            // Binomial distribution: each read has probability alt_probability 
-            // of being an alt allele, independently across depth reads.
-            // 
-            // Note: Biologically, sequencing is sampling without replacement 
-            // (there are a finite number of alleles in the sample), which would 
-            // be modeled by a hypergeometric distribution. However, when 
-            // sample_size >>> depth (typically sample_size is in the thousands 
-            // while depth is 10-1000x), the draws become essentially independent
-            // and the binomial approximation is accurate. This is analogous to
-            // how sampling a few balls from a very large urn approximates 
-            // sampling with replacement.
-            let binomial = Binomial::new(depth as u64, alt_probability)?;
-            let alt_reads = binomial.sample(rng) as u32;
+            if duplex_detected {
+                duplex.push(Mutation {
+                    depth: duplex_depth,
+                    alt_count: duplex_alt,
+                });
+            }
 
-            if alt_reads >= min_alt_reads {
-                detectable_mutations.push((depth, alt_reads));
+            if circles_detected && duplex_detected {
+                shared.push(SharedMutation {
+                    circles_depth,
+                    circles_alt,
+                    duplex_depth,
+                    duplex_alt,
+                });
             }
         }
     }
 
-    Ok(detectable_mutations)
-}
-
-fn sample_hypergeometric_stable(
-    population_size: u64,
-    success_states: u64,
-    draws: u64,
-    rng: &mut impl RngCore,
-) -> Result<u32> {
-    if draws == 0 {
-        return Ok(0);
-    }
-    
-    if success_states == 0 {
-        return Ok(0);
-    }
-    
-    if draws >= population_size {
-        return Ok(success_states as u32);
-    }
-    
-    // Sequential sampling: for each draw, calculate probability of drawing success
-    let mut successes = 0;
-    let mut remaining_success = success_states;
-    let mut remaining_population = population_size;
-    
-    for _ in 0..draws {
-        let prob = remaining_success as f64 / remaining_population as f64;
-        
-        if rng.gen::<f64>() < prob {
-            successes += 1;
-            remaining_success -= 1;
-        }
-        
-        remaining_population -= 1;
-        
-        if remaining_success == 0 {
-            break;
-        }
-    }
-    
-    Ok(successes)
+    Ok(SubsampledMutations {
+        circles,
+        duplex,
+        shared,
+    })
 }
