@@ -1,72 +1,26 @@
-import numpy as np
 import json
 import time
 from pathlib import Path
-from scipy.stats import loguniform, uniform, randint
 
+# Configuration
+PARAMS_FILE = config.get("params_file", "parameter_sets.json")
+SAMPLE_SIZE = config.get("sample_size", 1000000)
+N_REPLICATES = config.get("n_replicates", 5)
 
-DEPTH_FILES = [
-    Path(Path(workflow.basedir), "circles_depth.bed"),
-    Path(Path(workflow.basedir), "duplex_depth.bed"),
-]
+# Load parameter sets
+with open(PARAMS_FILE) as f:
+    PARAM_DATA = json.load(f)
 
-N_PARAM_SETS = 5
-N_REPLICATES = 1
-GENOME_SIZE = 1.2e6
+PARAM_IDS = [p["param_set"] for p in PARAM_DATA["parameter_sets"]]
 
-
-def sample_parameters():
-    # N (popsize) -> Unif(10^8, 10^10)
-    N_values = uniform.rvs(loc=1e8, scale=9e9, size=N_PARAM_SETS).astype(int)
-
-    # u (mutation rate per site) -> logUnif(10^-9, 10^-8)
-    u_per_site = loguniform.rvs(1e-9, 1e-8, size=N_PARAM_SETS)
-    u_total = u_per_site * GENOME_SIZE
-
-    # Nb (bottleneck size) -> logUnif(1, 1000)
-    Nb_values = loguniform.rvs(1, 1000, size=N_PARAM_SETS).astype(int)
-
-    # Gs (stasis generations) -> Unif(100, 10000)
-    Gs_values = uniform.rvs(loc=100, scale=9900, size=N_PARAM_SETS).astype(int)
-
-    sim_seeds = randint.rvs(0, 2**32, size=N_PARAM_SETS)
-
-    return [
-        {
-            "param_set": i,
-            "sim_seed": int(sim_seeds[i]),
-            "N": int(N_values[i]),
-            "u_per_site": float(u_per_site[i]),
-            "u_total": float(u_total[i]),
-            "genome_size": int(GENOME_SIZE),
-            "Nb": int(Nb_values[i]),
-            "Gs": int(Gs_values[i]),
-        }
-        for i in range(N_PARAM_SETS)
-    ]
+print(f"Loaded {len(PARAM_IDS)} parameter sets from {PARAMS_FILE}")
 
 
 rule all:
     input:
-        expand("results/{param_set}/", param_set=range(N_PARAM_SETS)),
-
-
-rule generate_all_params:
-    output:
-        params_json="parameter_sets.json",
-    run:
-        param_sets = sample_parameters()
-
-        output_data = {
-            "generation_time": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "n_param_sets": N_PARAM_SETS,
-            "n_replicates": N_REPLICATES,
-            "genome_size": int(GENOME_SIZE),
-            "parameter_sets": param_sets,
-        }
-
-        with open(output.params_json, "w") as f:
-            json.dump(output_data, f, indent=2)
+        expand("results/paramset_{param_set}_shared.csv", param_set=PARAM_IDS),
+        expand("results/paramset_{param_set}_circles.csv", param_set=PARAM_IDS),
+        expand("results/paramset_{param_set}_duplex.csv", param_set=PARAM_IDS),
 
 
 rule build_simulator:
@@ -84,40 +38,34 @@ rule build_simulator:
 rule run_sim:
     input:
         simulator=rules.build_simulator.output.binary,
-        params_json="parameter_sets.json",
+        params_json=PARAMS_FILE,
     output:
-        muts=directory("results/{param_set}/"),
+        shared="results/paramset_{param_set}_shared.csv",
+        circles="results/paramset_{param_set}_circles.csv",
+        duplex="results/paramset_{param_set}_duplex.csv",
     log:
-        "logs/{param_set}.txt",
+        "logs/paramset_{param_set}.log",
     threads: 1
     run:
-        import json
-
-        with open(input.params_json, "r") as f:
-            param_file = json.load(f)
-
-        param_data = param_file["parameter_sets"][int(wildcards.param_set)]
-
-        # Create output directory
-        
-
-        depth_files_str = ",".join(str(p) for p in DEPTH_FILES)
+        param_data = PARAM_DATA["parameter_sets"][int(wildcards.param_set)]
 
         cmd_args = [
             str(input.simulator),
-            "--sample-size", "1000000",
-            "--population-size", str(param_data['N']),
-            "--bottleneck-size", str(param_data['Nb']),
-            "--stasis-generations", str(param_data['Gs']),
-            "--mutation-rate", str(param_data['u_total']),
-            "--output-dir", f"{output.muts}",  
-            "--runs", str(N_REPLICATES),
-            "--seed", str(param_data['sim_seed']),
-            "--depth-files", depth_files_str
+            "-n", str(SAMPLE_SIZE),
+            "-N", str(param_data['N']),
+            "-b", str(param_data['Nb']),
+            "-g", str(param_data['Gs']),
+            "-u", str(param_data['u_total']),
+            "--output-prefix", f"results/paramset_{wildcards.param_set}",
+            "-R", str(N_REPLICATES),
+            "--seed", str(param_data.get('sim_seed', wildcards.param_set)),
+            "--min-alt-reads", "2",
+            "--min-depth-circles", "10",
+            "--min-depth-duplex", "10",
         ]
+        
         cmd = " ".join(cmd_args)
         
-        print(f"Running command: {cmd}")
-
+        print(f"Running param_set {wildcards.param_set}: N={param_data['N']}, Nb={param_data['Nb']}, Gs={param_data['Gs']}")
         
-        shell(f"{cmd} > {log} 2>&1")
+        shell(f"RUST_LOG=info {cmd} > {log} 2>&1")
