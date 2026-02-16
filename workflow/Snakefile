@@ -1,11 +1,11 @@
 import json
 import time
 from pathlib import Path
-
+localrules: aggregate_features
 # Configuration
 PARAMS_FILE = config.get("params_file", "parameter_sets.json")
-SAMPLE_SIZE = config.get("sample_size", 1000000)
-N_REPLICATES = config.get("n_replicates", 5)
+SAMPLE_SIZE = config.get("sample_size", 10_000_000)
+N_REPLICATES = config.get("n_replicates", 1)
 
 # Load parameter sets
 with open(PARAMS_FILE) as f:
@@ -18,10 +18,7 @@ print(f"Loaded {len(PARAM_IDS)} parameter sets from {PARAMS_FILE}")
 
 rule all:
     input:
-        expand("results/paramset_{param_set}_shared.csv", param_set=PARAM_IDS),
-        expand("results/paramset_{param_set}_circles.csv", param_set=PARAM_IDS),
-        expand("results/paramset_{param_set}_duplex.csv", param_set=PARAM_IDS),
-
+        expand("results/paramset_{param_set}_shared.csv", param_set=PARAM_IDS)
 
 rule build_simulator:
     input:
@@ -38,7 +35,6 @@ rule build_simulator:
 rule run_sim:
     input:
         simulator=rules.build_simulator.output.binary,
-        params_json=PARAMS_FILE,
     output:
         shared="results/paramset_{param_set}_shared.csv",
         circles="results/paramset_{param_set}_circles.csv",
@@ -60,8 +56,8 @@ rule run_sim:
             "-R", str(N_REPLICATES),
             "--seed", str(param_data.get('sim_seed', wildcards.param_set)),
             "--min-alt-reads", "2",
-            "--min-depth-circles", "10",
-            "--min-depth-duplex", "10",
+            "--min-depth-circles", "369",
+            "--min-depth-duplex", "1269",
         ]
         
         cmd = " ".join(cmd_args)
@@ -69,3 +65,4 @@ rule run_sim:
         print(f"Running param_set {wildcards.param_set}: N={param_data['N']}, Nb={param_data['Nb']}, Gs={param_data['Gs']}")
         
         shell(f"RUST_LOG=info {cmd} > {log} 2>&1")
+

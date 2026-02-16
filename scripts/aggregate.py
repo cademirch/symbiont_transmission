@@ -46,7 +46,17 @@ def aggregate_shared_mutations(results_dir, param_dict, output_file):
             
             if df.empty:
                 print(f"  Warning: {shared_file.name} is empty")
-                continue
+                df = pd.DataFrame(
+                    [
+                        {
+                            "run": 0,
+                            "circles_depth": 1,
+                            "circles_alt": 0,
+                            "duplex_depth": 1,
+                            "duplex_alt": 0,
+                        }
+                    ]
+                )
             
             # Add all parameter metadata as columns
             for key, value in params.items():
