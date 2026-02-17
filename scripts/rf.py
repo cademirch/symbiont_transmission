@@ -348,6 +348,7 @@ def save_training_outputs(
     importance_df,
     search_results=None,
     log_target=False,
+    meta_test=None,
 ):
     """Write model and all artifacts to disk."""
     out = Path(output_dir)
@@ -356,7 +357,6 @@ def save_training_outputs(
     joblib.dump(rf, out / "model.joblib")
     np.save(out / "af_bins.npy", bins)
 
-    # save config so predict knows how the model was trained
     pd.DataFrame([{"log_target": log_target}]).to_csv(out / "config.csv", index=False)
 
     scalar = {k: v for k, v in metrics.items() if not isinstance(v, np.ndarray)}
@@ -372,9 +372,18 @@ def save_training_outputs(
     }
     pd.DataFrame([hparams]).to_csv(out / "hyperparameters.csv", index=False)
 
-    pd.DataFrame(
-        {"y_true": metrics["y_test"], "y_pred": metrics["y_test_pred"]}
-    ).to_csv(out / "test_predictions.csv", index=False)
+    # test predictions with nuisance params
+    test_out = pd.DataFrame(
+        {
+            "y_true": metrics["y_test"],
+            "y_pred": metrics["y_test_pred"],
+        }
+    )
+    if meta_test is not None:
+        for col in ["N", "u_per_site", "Gs", "n_shared_mutations"]:
+            if col in meta_test.columns:
+                test_out[col] = meta_test[col].values
+    test_out.to_csv(out / "test_predictions.csv", index=False)
 
     importance_df.to_csv(out / "feature_importance.csv", index=False)
     metadata.to_csv(out / "metadata.csv", index=False)
@@ -416,6 +425,12 @@ def build_parser():
     tp.add_argument("--min-samples-leaf", type=int, default=1)
     tp.add_argument("--max-features", type=str, default="sqrt")
     tp.add_argument("--no-bootstrap", action="store_true")
+    tp.add_argument(
+        "--min-mutations",
+        type=int,
+        default=0,
+        help="Exclude samples with fewer than this many shared mutations",
+    )
 
     # --- predict ---
     pp = sub.add_parser("predict", help="Predict Nb from empirical data")
@@ -436,12 +451,24 @@ def cmd_train(args):
     bins = make_af_bins(args.n_bins)
     X, y, _, metadata = build_feature_matrix(df, bins, all_meta)
 
+    # drop samples with too few mutations
+    if args.min_mutations > 0:
+        mask = metadata["n_shared_mutations"] >= args.min_mutations
+        n_before = len(X)
+        X = X[mask.values]
+        y = y[mask.values]
+        metadata = metadata[mask].reset_index(drop=True)
+        print(
+            f"  --min-mutations {args.min_mutations}: kept {len(X)} / {n_before} samples"
+        )
+
     if args.log_target:
         y = np.log10(y)
         print(f"  log10(Nb) range: [{y.min():.2f}, {y.max():.2f}]")
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=args.test_size, random_state=42
+    # split metadata alongside X/y so test predictions have nuisance params
+    X_train, X_test, y_train, y_test, meta_train, meta_test = train_test_split(
+        X, y, metadata, test_size=args.test_size, random_state=42
     )
     print(f"\nSplit: {len(X_train)} train / {len(X_test)} test")
 
@@ -481,9 +508,9 @@ def cmd_train(args):
         importance_df,
         search_results,
         log_target=args.log_target,
+        meta_test=meta_test,
     )
     print("\nDone.")
-
 
 def cmd_predict(args):
     model_dir = Path(args.model_dir)
